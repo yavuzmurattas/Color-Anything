@@ -16,6 +16,14 @@ import functools
 # For perceptual loss (VGG)
 from torchvision import models
 
+# For SSIM (if available)
+try:
+    from skimage.metrics import structural_similarity as ssim
+    HAVE_SKIMAGE = True
+except ImportError:
+    HAVE_SKIMAGE = False
+
+
 # =========================================================
 # 0) Config
 # =========================================================
@@ -530,6 +538,18 @@ def load_ir_image(path, img_size=None):
     return img
 
 
+def load_rgb_image(path, img_size=None):
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError(f"Could not read RGB image: {path}")
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if img_size is not None:
+        img = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_AREA)
+    img = img.astype(np.float32) / 255.0
+    img = np.clip(img, 0.0, 1.0)
+    return img
+
+
 def ir_to_tensor(img_hw):
     img = img_hw[None, None, :, :]
     img = torch.from_numpy(img).float()
@@ -685,9 +705,38 @@ class KAISTPairDataset(Dataset):
 # 8) Test (inference) mode
 # =========================================================
 
+def compute_metrics(pred_01, gt_01):
+    """
+    pred_01, gt_01: HxWx3 float32 images in [0,1].
+    Returns: mae, mse, psnr, ssim_val
+    """
+    diff = pred_01 - gt_01
+    mae = float(np.mean(np.abs(diff)))
+    mse = float(np.mean(diff ** 2))
+    if mse == 0:
+        psnr = float('inf')
+    else:
+        psnr = 20.0 * math.log10(1.0) - 10.0 * math.log10(mse + 1e-12)
+
+    if HAVE_SKIMAGE:
+        try:
+            ssim_val = float(ssim(gt_01, pred_01, data_range=1.0, channel_axis=2))
+        except TypeError:
+            # Fallback for older scikit-image versions
+            ssim_val = float(ssim(gt_01, pred_01, data_range=1.0, multichannel=True))
+    else:
+        ssim_val = None
+
+    return mae, mse, psnr, ssim_val
+
+
 def run_test(cfg: Config):
     device = torch.device(cfg.device)
     print(f"[TEST] Device: {device}")
+
+    if not HAVE_SKIMAGE:
+        print("WARNING: scikit-image is not installed. SSIM will be reported as None.")
+        print("Install via: pip install scikit-image")
 
     model = IRColorizationModel(cfg)
     if cfg.test_G_weights is not None and os.path.isfile(cfg.test_G_weights):
@@ -700,9 +749,33 @@ def run_test(cfg: Config):
     model.eval()
 
     img_paths = collect_images(cfg.input_dir)
-    print(f"Found {len(img_paths)} images in {cfg.input_dir}")
+    print(f"Found {len(img_paths)} IR images in {cfg.input_dir}")
 
     os.makedirs(cfg.output_dir, exist_ok=True)
+
+    # Assume visible GT is in sibling 'visible' folder next to 'lwir'
+    ir_dir = cfg.input_dir
+    if os.path.basename(ir_dir).lower() == "lwir":
+        vis_dir = os.path.join(os.path.dirname(ir_dir), "visible")
+    else:
+        vis_dir = ir_dir.replace("lwir", "visible")
+
+    if not os.path.isdir(vis_dir):
+        print(f"WARNING: visible directory not found at: {vis_dir}")
+        print("Metrics will be skipped (no ground truth RGB found).")
+
+    # Metrics accumulation
+    metrics_list = []
+    sum_mae = 0.0
+    sum_mse = 0.0
+    sum_psnr = 0.0
+    sum_ssim = 0.0
+    count = 0
+
+    best_psnr = -1.0
+    best_psnr_sample = None
+    best_ssim = -1.0
+    best_ssim_sample = None
 
     for idx, path in enumerate(img_paths, start=1):
         ir = load_ir_image(path, img_size=cfg.img_size)
@@ -711,15 +784,109 @@ def run_test(cfg: Config):
         with torch.no_grad():
             fake_rgb = model(ir_tensor)
 
-        fake_rgb_np = tensor_to_rgb_image(fake_rgb)
+        fake_rgb_np = tensor_to_rgb_image(fake_rgb)  # uint8, HxWx3, [0..255]
         base = os.path.basename(path)
         out_path = os.path.join(cfg.output_dir, base)
         save_rgb(out_path, fake_rgb_np)
+
+        # Metrics: only if GT exists
+        gt_path = os.path.join(vis_dir, base)
+        if os.path.isfile(gt_path):
+            gt_rgb_01 = load_rgb_image(gt_path, img_size=cfg.img_size)   # [0,1] float
+            pred_rgb_01 = fake_rgb_np.astype(np.float32) / 255.0         # [0,1] float
+
+            mae, mse, psnr_val, ssim_val = compute_metrics(pred_rgb_01, gt_rgb_01)
+
+            metrics_list.append({
+                "file": base,
+                "mae": mae,
+                "mse": mse,
+                "psnr": psnr_val,
+                "ssim": ssim_val,
+            })
+
+            sum_mae += mae
+            sum_mse += mse
+            if np.isfinite(psnr_val):
+                sum_psnr += psnr_val
+            if ssim_val is not None:
+                sum_ssim += ssim_val
+            count += 1
+
+            if np.isfinite(psnr_val) and psnr_val > best_psnr:
+                best_psnr = psnr_val
+                best_psnr_sample = base
+            if ssim_val is not None and ssim_val > best_ssim:
+                best_ssim = ssim_val
+                best_ssim_sample = base
+
+        else:
+            print(f"[WARN] No GT RGB found for {base} at {gt_path}; metrics skipped for this image.")
 
         if idx % 10 == 0 or idx == len(img_paths):
             print(f"[{idx}/{len(img_paths)}] {path} -> {out_path}")
 
     print("Test finished.")
+
+    # Write metrics to file
+    if count > 0:
+        mean_mae = sum_mae / count
+        mean_mse = sum_mse / count
+        mean_psnr = sum_psnr / count
+        mean_ssim = (sum_ssim / count) if (HAVE_SKIMAGE and count > 0) else None
+
+        print("\n=== Test Metrics (on images with GT) ===")
+        print(f"Count      : {count}")
+        print(f"Mean MAE   : {mean_mae:.6f}")
+        print(f"Mean MSE   : {mean_mse:.6f}")
+        print(f"Mean PSNR  : {mean_psnr:.4f} dB")
+        if HAVE_SKIMAGE:
+            print(f"Mean SSIM  : {mean_ssim:.6f}")
+        else:
+            print("Mean SSIM  : None (scikit-image not installed)")
+        if best_psnr_sample is not None:
+            print(f"Best PSNR  : {best_psnr:.4f} ({best_psnr_sample})")
+        else:
+            print("Best PSNR  : N/A")
+        if HAVE_SKIMAGE and best_ssim_sample is not None:
+            print(f"Best SSIM  : {best_ssim:.6f} ({best_ssim_sample})")
+        else:
+            print("Best SSIM  : N/A")
+
+        metrics_path = os.path.join(cfg.output_dir, "metrics_test.csv")
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            f.write("file,mae,mse,psnr,ssim\n")
+            for m in metrics_list:
+                ssim_str = "" if m["ssim"] is None else f"{m['ssim']:.6f}"
+                f.write(f"{m['file']},{m['mae']:.8f},{m['mse']:.8f},{m['psnr']:.6f},{ssim_str}\n")
+
+            f.write("\n# Summary\n")
+            f.write(f"# count,{count}\n")
+            f.write(f"# mean_mae,{mean_mae:.8f}\n")
+            f.write(f"# mean_mse,{mean_mse:.8f}\n")
+            f.write(f"# mean_psnr,{mean_psnr:.6f}\n")
+            if mean_ssim is not None:
+                f.write(f"# mean_ssim,{mean_ssim:.6f}\n")
+            else:
+                f.write(f"# mean_ssim,\n")
+
+            best_psnr_str = "nan"
+            if np.isfinite(best_psnr) and best_psnr_sample is not None:
+                best_psnr_str = f"{best_psnr:.6f}"
+
+            f.write(f"# best_psnr_file,{'' if best_psnr_sample is None else best_psnr_sample}\n")
+            f.write(f"# best_psnr,{best_psnr_str}\n")
+
+            if HAVE_SKIMAGE and best_ssim_sample is not None:
+                best_ssim_str = f"{best_ssim:.6f}"
+            else:
+                best_ssim_str = ""
+            f.write(f"# best_ssim_file,{'' if best_ssim_sample is None else best_ssim_sample}\n")
+            f.write(f"# best_ssim,{best_ssim_str}\n")
+
+        print(f"\nMetrics saved to: {metrics_path}")
+    else:
+        print("No metrics were computed (no matching GT RGB images found).")
 
 
 # =========================================================
