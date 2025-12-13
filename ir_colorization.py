@@ -64,7 +64,7 @@ class Config:
         # ---------- TEST (INFERENCE) ----------
         self.input_dir = r"kaist-dataset\versions\1\set01\V000\lwir"
         self.output_dir = "./results"
-        self.test_G_weights = r"./checkpoints_kaist/netG_epoch_050.pth"
+        self.test_G_weights = r"./checkpoints_kaist/netG_best.pth"  # use best model by default
 
 
 # =========================================================
@@ -751,6 +751,9 @@ def train_kaist(cfg: Config):
 
     os.makedirs(cfg.save_dir, exist_ok=True)
 
+    best_val_l1 = float("inf")
+    best_ckpt_path = os.path.join(cfg.save_dir, "netG_best.pth")
+
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         netD.train()
@@ -814,11 +817,17 @@ def train_kaist(cfg: Config):
             f"val L1: {val_l1:.4f}"
         )
 
+        # Save periodic checkpoints
         if (epoch % cfg.save_every == 0) or (epoch == cfg.epochs):
             ckpt_path = os.path.join(cfg.save_dir, f"netG_epoch_{epoch:03d}.pth")
             torch.save(model.netG.state_dict(), ckpt_path)
             print(f"Saved generator checkpoint to {ckpt_path}")
 
+        # Save best model based on validation L1
+        if val_l1 < best_val_l1:
+            best_val_l1 = val_l1
+            torch.save(model.netG.state_dict(), best_ckpt_path)
+            print(f"New best model saved to {best_ckpt_path} (val L1={best_val_l1:.4f})")
 
 # =========================================================
 # 11) main
