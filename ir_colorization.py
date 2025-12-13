@@ -13,6 +13,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import functools
 
+# For perceptual loss (VGG)
+from torchvision import models
 
 # =========================================================
 # 0) Config
@@ -53,6 +55,10 @@ class Config:
         self.beta1 = 0.5
         self.beta2 = 0.999
         self.lambda_L1 = 100.0
+        # Perceptual + TV loss weights
+        self.lambda_perc = 10.0
+        self.lambda_tv = 1e-4
+
         self.num_workers = 4
         self.save_dir = "./checkpoints_kaist"
         self.save_every = 5
@@ -426,7 +432,54 @@ class NLayerDiscriminator(nn.Module):
 
 
 # =========================================================
-# 5) IRColorizationModel wrapper
+# 6) Perceptual loss (VGG-16) + TV loss
+# =========================================================
+
+class VGGPerceptual(nn.Module):
+    """
+    Uses VGG-16 pretrained on ImageNet.
+    Input is expected in [-1,1]; it is converted to [0,1] and normalized.
+    """
+    def __init__(self, device):
+        super().__init__()
+        # torchvision >= 0.13 style weights API
+        try:
+            vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
+        except AttributeError:
+            # older version fallback
+            vgg = models.vgg16(pretrained=True)
+
+        # up to relu3_3 (approx. features[:16])
+        self.features = nn.Sequential(*list(vgg.features.children())[:16]).to(device)
+        for p in self.features.parameters():
+            p.requires_grad = False
+        self.features.eval()
+
+        # ImageNet normalization
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
+
+    def forward(self, x):
+        # x: Bx3xHxW in [-1,1]
+        x = (x + 1.0) / 2.0  # to [0,1]
+        x = (x - self.mean) / self.std
+        return self.features(x)
+
+
+def tv_loss(x):
+    """
+    Total variation loss, encouraging spatial smoothness.
+    x: BxCxHxW
+    """
+    diff_i = torch.mean(torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :]))
+    diff_j = torch.mean(torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]))
+    return diff_i + diff_j
+
+
+# =========================================================
+# 7) IRColorizationModel wrapper
 # =========================================================
 
 class IRColorizationModel(nn.Module):
@@ -749,6 +802,9 @@ def train_kaist(cfg: Config):
     criterionGAN = nn.MSELoss()
     criterionL1 = nn.L1Loss()
 
+    # Perceptual loss model (VGG)
+    vgg_perc = VGGPerceptual(device).to(device)
+
     os.makedirs(cfg.save_dir, exist_ok=True)
 
     best_val_l1 = float("inf")
@@ -793,7 +849,16 @@ def train_kaist(cfg: Config):
             target_real = torch.ones_like(pred_fake)
             loss_G_GAN = criterionGAN(pred_fake, target_real)
             loss_G_L1 = criterionL1(fake_rgb, rgb) * cfg.lambda_L1
-            loss_G = loss_G_GAN + loss_G_L1
+
+            # Perceptual loss
+            feat_fake = vgg_perc(fake_rgb)
+            feat_real = vgg_perc(rgb)
+            loss_G_perc = F.l1_loss(feat_fake, feat_real) * cfg.lambda_perc
+
+            # TV loss
+            loss_G_TV = tv_loss(fake_rgb) * cfg.lambda_tv
+
+            loss_G = loss_G_GAN + loss_G_L1 + loss_G_perc + loss_G_TV
             loss_G.backward()
             optimizerG.step()
 
@@ -805,7 +870,8 @@ def train_kaist(cfg: Config):
                 print(
                     f"Epoch [{epoch}/{cfg.epochs}] Step [{i}/{len(train_loader)}] "
                     f"D: {loss_D.item():.4f} | G: {loss_G.item():.4f} "
-                    f"(GAN {loss_G_GAN.item():.4f} + L1 {loss_G_L1.item():.4f})"
+                    f"(GAN {loss_G_GAN.item():.4f} + L1 {loss_G_L1.item():.4f} "
+                    f"+ Perc {loss_G_perc.item():.4f} + TV {loss_G_TV.item():.6f})"
                 )
 
         avg_g_loss = epoch_g_loss / max(steps, 1)
