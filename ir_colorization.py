@@ -72,6 +72,9 @@ class Config:
         self.save_every = 5
         self.val_ratio = 0.1  # percentage of dataset used for validation
 
+        # Learning rate decay: after this epoch, linearly decay LR to 0
+        self.lr_decay_start_epoch = 25  # for 50 epochs: first 25 const, last 25 decay
+
         # Optionally start training with a pretrained generator
         self.init_G_weights = None  # e.g., r"./pretrained_netG.pth"
 
@@ -134,6 +137,21 @@ def init_net(net, init_type='normal', init_gain=0.02,
     if initialize_weights:
         init_weights(net, init_type, init_gain)
     return net
+
+
+def get_lr_lambda(cfg: Config):
+    """Linear LR decay after lr_decay_start_epoch."""
+    def lr_lambda(epoch):
+        # epoch is 0-based in scheduler, but we use 1-based logic in training loop
+        e = epoch + 1
+        if e <= cfg.lr_decay_start_epoch:
+            return 1.0
+        else:
+            if e >= cfg.epochs:
+                return 0.0
+            frac = float(e - cfg.lr_decay_start_epoch) / float(max(1, cfg.epochs - cfg.lr_decay_start_epoch))
+            return max(0.0, 1.0 - frac)
+    return lr_lambda
 
 
 # =========================================================
@@ -966,6 +984,11 @@ def train_kaist(cfg: Config):
     optimizerD = torch.optim.Adam(netD.parameters(),
                                   lr=cfg.lr_D, betas=(cfg.beta1, cfg.beta2))
 
+    # LR schedulers (linear decay)
+    lr_lambda = get_lr_lambda(cfg)
+    schedulerG = torch.optim.lr_scheduler.LambdaLR(optimizerG, lr_lambda=lr_lambda)
+    schedulerD = torch.optim.lr_scheduler.LambdaLR(optimizerD, lr_lambda=lr_lambda)
+
     criterionGAN = nn.MSELoss()
     criterionL1 = nn.L1Loss()
 
@@ -1061,6 +1084,15 @@ def train_kaist(cfg: Config):
             best_val_l1 = val_l1
             torch.save(model.netG.state_dict(), best_ckpt_path)
             print(f"New best model saved to {best_ckpt_path} (val L1={best_val_l1:.4f})")
+
+        # Step LR schedulers
+        schedulerG.step()
+        schedulerD.step()
+        current_lr_G = optimizerG.param_groups[0]["lr"]
+        print(f"Current LR (G): {current_lr_G:.6e}")
+
+    print(f"Training finished. Best val L1: {best_val_l1:.4f}, best model: {best_ckpt_path}")
+
 
 # =========================================================
 # 11) main
