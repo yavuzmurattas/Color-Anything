@@ -2,6 +2,7 @@ import os
 import random
 from glob import glob
 import math
+import shutil
 
 import cv2
 import numpy as np
@@ -83,6 +84,10 @@ class Config:
         self.input_dir = r"kaist-dataset\versions\1\set01\V000\lwir"
         self.output_dir = "./results"
         self.test_G_weights = r"./checkpoints_kaist/netG_best.pth"  # use best model by default
+
+        # Top-K best output saving
+        self.topk = 50
+        self.best50_dirname = "Best_50_colored_images"
 
 
 # =========================================================
@@ -432,11 +437,7 @@ class ResnetUNetGenerator(nn.Module):
         y = self.up2_conv(y)            # (B, 64, H, W)
 
         out = self.outc(y)              # (B, 3, H, W)
-        if layers is None or len(layers) == 0 or not encode_only:
-            return out, None
-        else:
-            # Not used in this implementation
-            return out, None
+        return out, None
 
 
 # =========================================================
@@ -780,6 +781,68 @@ def compute_metrics(pred_01, gt_01):
     return mae, mse, psnr, ssim_val
 
 
+def save_best_k_outputs(cfg: Config, metrics_list):
+    """
+    Copies best-K colored images from cfg.output_dir into:
+        cfg.output_dir / cfg.best50_dirname
+    Ranking metric:
+      - SSIM if available, else PSNR
+    Also writes a ranking file.
+    """
+    if not metrics_list:
+        print("[TOP-K] metrics_list empty, skipping best-K save.")
+        return
+
+    # Prefer SSIM if available and present
+    if HAVE_SKIMAGE and any(m.get("ssim") is not None for m in metrics_list):
+        metric_key = "ssim"
+    else:
+        metric_key = "psnr"
+
+    valid = []
+    for m in metrics_list:
+        v = m.get(metric_key, None)
+        if v is None:
+            continue
+        if isinstance(v, float) and (not np.isfinite(v)):
+            continue
+        valid.append(m)
+
+    if not valid:
+        print(f"[TOP-K] No valid '{metric_key}' values, skipping best-K save.")
+        return
+
+    valid.sort(key=lambda x: x[metric_key], reverse=True)
+    top_k = valid[:max(1, int(cfg.topk))]
+
+    best_dir = os.path.join(cfg.output_dir, cfg.best50_dirname)
+    os.makedirs(best_dir, exist_ok=True)
+
+    rank_path = os.path.join(best_dir, f"top_{len(top_k)}_ranking.csv")
+    with open(rank_path, "w", encoding="utf-8") as f:
+        f.write(f"rank,file,mae,mse,psnr,ssim,metric_used\n")
+        for r, m in enumerate(top_k, start=1):
+            ssim_val = m.get("ssim", None)
+            ssim_str = "" if ssim_val is None else f"{ssim_val:.6f}"
+            f.write(
+                f"{r},{m['file']},{m['mae']:.8f},{m['mse']:.8f},{m['psnr']:.6f},{ssim_str},{metric_key}\n"
+            )
+
+    copied = 0
+    for m in top_k:
+        fname = m["file"]
+        src = os.path.join(cfg.output_dir, fname)
+        dst = os.path.join(best_dir, fname)
+        if os.path.isfile(src):
+            shutil.copy2(src, dst)
+            copied += 1
+        else:
+            print(f"[TOP-K][WARN] Missing output file, cannot copy: {src}")
+
+    print(f"[TOP-K] Saved best {copied}/{len(top_k)} outputs to: {best_dir}")
+    print(f"[TOP-K] Ranking file: {rank_path}")
+
+
 def run_test(cfg: Config):
     device = torch.device(cfg.device)
     print(f"[TEST] Device: {device}")
@@ -841,7 +904,7 @@ def run_test(cfg: Config):
 
         # Metrics: only if GT exists
         gt_path = os.path.join(vis_dir, base)
-        if os.path.isfile(gt_path):
+        if os.path.isdir(vis_dir) and os.path.isfile(gt_path):
             gt_rgb_01 = load_rgb_image(gt_path, img_size=cfg.img_size)   # [0,1] float
             pred_rgb_01 = fake_rgb_np.astype(np.float32) / 255.0         # [0,1] float
 
@@ -871,7 +934,8 @@ def run_test(cfg: Config):
                 best_ssim_sample = base
 
         else:
-            print(f"[WARN] No GT RGB found for {base} at {gt_path}; metrics skipped for this image.")
+            if os.path.isdir(vis_dir):
+                print(f"[WARN] No GT RGB found for {base} at {gt_path}; metrics skipped for this image.")
 
         if idx % 10 == 0 or idx == len(img_paths):
             print(f"[{idx}/{len(img_paths)}] {path} -> {out_path}")
@@ -920,21 +984,11 @@ def run_test(cfg: Config):
             else:
                 f.write(f"# mean_ssim,\n")
 
-            best_psnr_str = "nan"
-            if np.isfinite(best_psnr) and best_psnr_sample is not None:
-                best_psnr_str = f"{best_psnr:.6f}"
-
-            f.write(f"# best_psnr_file,{'' if best_psnr_sample is None else best_psnr_sample}\n")
-            f.write(f"# best_psnr,{best_psnr_str}\n")
-
-            if HAVE_SKIMAGE and best_ssim_sample is not None:
-                best_ssim_str = f"{best_ssim:.6f}"
-            else:
-                best_ssim_str = ""
-            f.write(f"# best_ssim_file,{'' if best_ssim_sample is None else best_ssim_sample}\n")
-            f.write(f"# best_ssim,{best_ssim_str}\n")
-
         print(f"\nMetrics saved to: {metrics_path}")
+
+        # --------- Save Best-50 colored outputs ----------
+        save_best_k_outputs(cfg, metrics_list)
+
     else:
         print("No metrics were computed (no matching GT RGB images found).")
 
