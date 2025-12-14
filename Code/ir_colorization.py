@@ -14,10 +14,10 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import functools
 
-# For perceptual loss (VGG)
+# Perceptual loss backbone (VGG)
 from torchvision import models
 
-# For SSIM (if available)
+# SSIM metric (optional; used only during evaluation)
 try:
     from skimage.metrics import structural_similarity as ssim
     HAVE_SKIMAGE = True
@@ -26,80 +26,137 @@ except ImportError:
 
 
 # =========================================================
-# 0) Config
+# 0) Configuration
 # =========================================================
 
 class Config:
-    def __init__(self):
-        # "train"  => train on KAIST IR→RGB pairs
-        # "test"   => colorize IR images from input_dir and compute metrics
-        self.mode = "test"   # "train" or "test"
+    """
+    Central configuration container.
 
-        # Device
+    This script supports two modes:
+      - "train": Train a Pix2Pix-style cGAN (PatchGAN + LSGAN) using KAIST paired IR (LWIR) and visible RGB.
+      - "test" : Run inference on KAIST test sets, save predictions, compute metrics (if GT exists),
+                 optionally save side-by-side collages, and export Top-K best results.
+
+    Notes about KAIST folder layout assumed by this code:
+      - IR images live under:  <setXX>/<sequence>/lwir/
+      - RGB images live under: <setXX>/<sequence>/visible/
+      - Pairing is performed by matching filenames between lwir/ and visible/ directories.
+    """
+    def __init__(self):
+        # "train" => train on KAIST IR→RGB pairs
+        # "test"  => colorize IR images from test sets, compute metrics, and save outputs
+        self.mode = "test"  # "train" or "test"
+
+        # Device selection
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Image size (images will be resized to img_size x img_size)
+        # Target image resolution (all inputs/outputs are resized to img_size x img_size)
         self.img_size = 256
 
-        # Input / output channel counts
-        self.input_nc = 1     # IR (grayscale)
-        self.output_nc = 3    # RGB
+        # Channel counts
+        self.input_nc = 1   # IR (grayscale)
+        self.output_nc = 3  # RGB
+
+        # Generator base feature width
         self.ngf = 64
+
+        # Normalization type used in the generator and discriminator ("instance", "batch", or "none")
         self.norm = "instance"
+
+        # Anti-aliasing controls for downsample/upsample operations
         self.no_antialias = False
         self.no_antialias_up = False
 
         # ---------- TRAIN (KAIST) ----------
-        # KAIST_ROOT:
-        #   KAIST_ROOT/
-        #     V000/lwir, V000/visible
-        #     V001/lwir, V001/visible
-        #     ...
-        self.kaist_root = r"kaist-dataset\versions\1\set00"
+        # Training sets: set00, set01, set03, set04
+        self.train_roots = [
+            r"kaist-dataset\versions\1\set00",
+            r"kaist-dataset\versions\1\set01",
+            r"kaist-dataset\versions\1\set03",
+            r"kaist-dataset\versions\1\set04",
+        ]
 
+        # Kept for legacy logging; training actually uses train_roots
+        self.kaist_root = self.train_roots[0]
+
+        # Training hyperparameters
         self.batch_size = 4
         self.epochs = 50
         self.lr_G = 2e-4
         self.lr_D = 2e-4
         self.beta1 = 0.5
         self.beta2 = 0.999
-        self.lambda_L1 = 100.0
-        # Perceptual + TV loss weights
-        self.lambda_perc = 10.0
-        self.lambda_tv = 1e-4
 
+        # Loss weights (Pix2Pix-style)
+        self.lambda_L1 = 100.0          # pixel L1 term
+        self.lambda_perc = 10.0         # VGG perceptual term
+        self.lambda_tv = 1e-4           # total variation term
+
+        # DataLoader settings
         self.num_workers = 4
+
+        # Checkpointing
         self.save_dir = "./checkpoints_kaist"
         self.save_every = 5
-        self.val_ratio = 0.1  # percentage of dataset used for validation
 
-        # Learning rate decay: after this epoch, linearly decay LR to 0
-        self.lr_decay_start_epoch = 25  # for 50 epochs: first 25 const, last 25 decay
+        # Validation split ratio (fraction of full training data)
+        self.val_ratio = 0.1
 
-        # Optionally start training with a pretrained generator
-        self.init_G_weights = None  # e.g., r"./pretrained_netG.pth"
+        # Learning rate decay schedule:
+        # Keep LR constant until lr_decay_start_epoch, then linearly decay to zero at the final epoch.
+        self.lr_decay_start_epoch = 25
+
+        # Optional: initialize generator weights from a checkpoint before training begins
+        self.init_G_weights = None  # e.g. r"./some_generator_checkpoint.pth"
 
         # ---------- TEST (INFERENCE + METRICS) ----------
-        # input_dir should point to an "lwir" folder; visible GT is assumed to sit next to it
-        self.input_dir = r"kaist-dataset\versions\1\set01\V000\lwir"
-        self.output_dir = "./results"
-        self.test_G_weights = r"./checkpoints_kaist/netG_best.pth"  # use best model by default
+        # Test sets: set02, set05
+        self.test_roots = [
+            r"kaist-dataset\versions\1\set02",
+            r"kaist-dataset\versions\1\set05",
+        ]
 
-        # Top-K best output saving
+        # Save side-by-side comparison images (IR | Pred | GT if available)
+        self.save_comparisons = True
+        self.comparison_dirname = "Comparisons"
+        self.comparison_add_text = True
+        self.comparison_pad = 8
+        self.comparison_font_scale = 0.6
+        self.comparison_thickness = 2
+
+        # Copy Top-K best results into a dedicated folder
+        self.best50_copy_preds = True
+        self.best50_copy_collages = True
+        self.best50_preds_subdir = "colored"
+        self.best50_collages_subdir = "collages"
+
+        # Legacy single-folder inference input (kept as a fallback if test_roots is empty)
+        self.input_dir = r"kaist-dataset\versions\1\set01\V000\lwir"
+
+        # Output folders
+        self.output_dir = "./results"
+        self.test_G_weights = r"./checkpoints_kaist/netG_best.pth"  # default model for inference
+
+        # Top-K selection size
         self.topk = 50
         self.best50_dirname = "Best_50_colored_images"
 
 
 # =========================================================
-# 1) Basic helpers + norm / init
+# 1) Normalization and weight initialization helpers
 # =========================================================
 
 class Identity(nn.Module):
+    """A pass-through layer used when normalization is disabled."""
     def forward(self, x):
         return x
 
 
 def get_norm_layer(norm_type='instance'):
+    """
+    Return a normalization layer constructor based on norm_type.
+    """
     if norm_type == 'batch':
         return nn.BatchNorm2d
     elif norm_type == 'instance':
@@ -111,6 +168,12 @@ def get_norm_layer(norm_type='instance'):
 
 
 def init_weights(net, init_type='normal', init_gain=0.02):
+    """
+    Initialize weights for convolutional/linear layers, and normalization layers.
+
+    - Conv/Linear: normal/xavier/kaiming/orthogonal initialization
+    - Norm layers: weights ~ N(1, init_gain), bias = 0
+    """
     def init_func(m):
         classname = m.__class__.__name__
         if hasattr(m, 'weight') and (
@@ -139,6 +202,9 @@ def init_weights(net, init_type='normal', init_gain=0.02):
 
 def init_net(net, init_type='normal', init_gain=0.02,
              device=torch.device('cpu'), initialize_weights=True):
+    """
+    Move a network to the target device and optionally initialize its parameters.
+    """
     net.to(device)
     if initialize_weights:
         init_weights(net, init_type, init_gain)
@@ -146,25 +212,41 @@ def init_net(net, init_type='normal', init_gain=0.02,
 
 
 def get_lr_lambda(cfg: Config):
-    """Linear LR decay after lr_decay_start_epoch."""
+    """
+    Build a scheduler function for linear learning-rate decay.
+
+    The LambdaLR scheduler uses an epoch index starting from 0.
+    This function maps that to an intuitive 1-based epoch number internally.
+    """
     def lr_lambda(epoch):
-        # epoch is 0-based in scheduler, but we use 1-based logic in training loop
-        e = epoch + 1
+        e = epoch + 1  # convert scheduler epoch (0-based) to training epoch (1-based)
+
+        # Constant LR phase
         if e <= cfg.lr_decay_start_epoch:
             return 1.0
-        else:
-            if e >= cfg.epochs:
-                return 0.0
-            frac = float(e - cfg.lr_decay_start_epoch) / float(max(1, cfg.epochs - cfg.lr_decay_start_epoch))
-            return max(0.0, 1.0 - frac)
+
+        # Decay phase
+        if e >= cfg.epochs:
+            return 0.0
+
+        # Linearly decay from 1.0 to 0.0 between lr_decay_start_epoch and epochs
+        frac = float(e - cfg.lr_decay_start_epoch) / float(max(1, cfg.epochs - cfg.lr_decay_start_epoch))
+        return max(0.0, 1.0 - frac)
+
     return lr_lambda
 
 
 # =========================================================
-# 2) Anti-aliased Downsample / Upsample
+# 2) Anti-aliased downsample / upsample blocks
 # =========================================================
 
 def get_filter(filt_size=3):
+    """
+    Create a 2D binomial (approx. Gaussian) filter of size filt_size x filt_size.
+    This is used to reduce aliasing when downsampling or to smooth after upsampling.
+
+    filt_size must be in [1..7].
+    """
     if filt_size == 1:
         a = np.array([1.], dtype=np.float32)
     elif filt_size == 2:
@@ -188,6 +270,13 @@ def get_filter(filt_size=3):
 
 
 class Downsample(nn.Module):
+    """
+    Blur + strided convolution downsampling.
+
+    Instead of using a strided conv directly (which can introduce aliasing),
+    this performs reflection/replication/zero padding, then convolves with a fixed blur filter
+    using stride > 1 to reduce spatial resolution.
+    """
     def __init__(self, channels, pad_type='reflect', filt_size=3, stride=2, pad_off=0):
         super().__init__()
         self.filt_size = filt_size
@@ -225,15 +314,23 @@ class Downsample(nn.Module):
 
 
 class UpsampleAA(nn.Module):
-    """Anti-aliased upsample: bilinear + blur."""
+    """
+    Anti-aliased upsampling.
+
+    Approach:
+      1) Bilinear resize to increase spatial resolution.
+      2) Blur with a fixed low-pass filter to reduce ringing/aliasing artifacts.
+    """
     def __init__(self, channels, filt_size=3, stride=2, pad_type='reflect'):
         super().__init__()
         self.stride = stride
+
         filt = get_filter(filt_size)
         self.register_buffer(
             'filt',
             filt[None, None, :, :].repeat(channels, 1, 1, 1)
         )
+
         pad = (filt_size - 1) / 2
         self.pad_sizes = [
             int(pad),
@@ -262,10 +359,15 @@ class UpsampleAA(nn.Module):
 
 
 # =========================================================
-# 3) ResNet Block
+# 3) ResNet block (used in generator bottleneck)
 # =========================================================
 
 class ResnetBlock(nn.Module):
+    """
+    Standard ResNet block:
+      - Conv -> Norm -> ReLU -> (optional Dropout) -> Conv -> Norm
+      - Residual connection: output = input + block(input)
+    """
     def __init__(self, dim, padding_type='reflect', norm_layer=nn.InstanceNorm2d,
                  use_dropout=False, use_bias=False):
         super().__init__()
@@ -277,6 +379,7 @@ class ResnetBlock(nn.Module):
         conv_block = []
         p = 0
 
+        # First conv padding strategy
         if padding_type == 'reflect':
             conv_block += [nn.ReflectionPad2d(1)]
         elif padding_type == 'replicate':
@@ -292,10 +395,12 @@ class ResnetBlock(nn.Module):
             nn.ReLU(True),
         ]
 
+        # Optional dropout helps regularization in some setups
         if use_dropout:
             conv_block += [nn.Dropout(0.5)]
 
         p = 0
+        # Second conv padding strategy
         if padding_type == 'reflect':
             conv_block += [nn.ReflectionPad2d(1)]
         elif padding_type == 'replicate':
@@ -317,15 +422,26 @@ class ResnetBlock(nn.Module):
 
 
 # =========================================================
-# 4) U-Net style ResNet Generator (IR-colorization / CUT-style)
+# 4) Generator: U-Net-like encoder/decoder with ResNet bottleneck
 # =========================================================
 
 class ResnetUNetGenerator(nn.Module):
     """
-    U-Net style generator:
-    - Encoder: c7s1-64 -> d128 -> d256
-    - Bottleneck: 9 ResNet blocks at 256 channels
-    - Decoder: up256->128 with skip from 128, up128->64 with skip from 64
+    A U-Net style generator with a ResNet bottleneck.
+
+    High-level structure:
+      - Encoder:
+          c7s1-64
+          down: 64 -> 128 (spatial /2)
+          down: 128 -> 256 (spatial /2)
+      - Bottleneck:
+          N ResNet blocks at 256 channels
+      - Decoder:
+          up: 256 -> (concat skip 128) -> 128
+          up: 128 -> (concat skip 64)  -> 64
+          output: c7s1-3 + tanh
+
+    Output is in [-1, 1] due to tanh activation.
     """
     def __init__(self, input_nc, output_nc, ngf=64,
                  norm_layer=nn.InstanceNorm2d,
@@ -334,12 +450,14 @@ class ResnetUNetGenerator(nn.Module):
                  no_antialias=False, no_antialias_up=False):
         super().__init__()
         assert n_blocks >= 0
+
+        # Bias usage depends on normalization choice
         if isinstance(norm_layer, functools.partial):
             use_bias = (norm_layer.func == nn.InstanceNorm2d)
         else:
             use_bias = (norm_layer == nn.InstanceNorm2d)
 
-        # Initial conv: c7s1-64
+        # Initial conv: 7x7, stride 1
         self.inc = nn.Sequential(
             nn.ReflectionPad2d(3),
             nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0, bias=use_bias),
@@ -347,7 +465,9 @@ class ResnetUNetGenerator(nn.Module):
             nn.ReLU(True),
         )
 
-        # Down 1: 64 -> 128, /2
+        # Downsampling stage 1 (64 -> 128)
+        # If no_antialias is False, we do conv stride 1 + blur-downsample.
+        # If True, we do a stride-2 conv directly.
         stride_d = 1 if not no_antialias else 2
         self.down1 = nn.Sequential(
             nn.Conv2d(ngf, ngf * 2, kernel_size=3, stride=stride_d, padding=1, bias=use_bias),
@@ -356,7 +476,7 @@ class ResnetUNetGenerator(nn.Module):
         )
         self.down1_down = None if no_antialias else Downsample(ngf * 2)
 
-        # Down 2: 128 -> 256, /2 again
+        # Downsampling stage 2 (128 -> 256)
         self.down2 = nn.Sequential(
             nn.Conv2d(ngf * 2, ngf * 4, kernel_size=3, stride=stride_d, padding=1, bias=use_bias),
             norm_layer(ngf * 4),
@@ -364,7 +484,7 @@ class ResnetUNetGenerator(nn.Module):
         )
         self.down2_down = None if no_antialias else Downsample(ngf * 4)
 
-        # ResNet blocks (bottleneck) at 256 channels
+        # Bottleneck: stack of ResNet blocks at 256 channels
         blocks = []
         for _ in range(n_blocks):
             blocks.append(
@@ -372,7 +492,9 @@ class ResnetUNetGenerator(nn.Module):
             )
         self.resblocks = nn.Sequential(*blocks)
 
-        # Up 1: 256 -> 256 (upsample), then concat with 128, then conv to 128
+        # Upsampling stage 1:
+        # Upsample 256 channels to match x1 resolution, then concatenate skip from x1 (128),
+        # then reduce to 128 channels.
         if no_antialias_up:
             self.up1_up = nn.ConvTranspose2d(
                 ngf * 4, ngf * 4,
@@ -387,7 +509,9 @@ class ResnetUNetGenerator(nn.Module):
             nn.ReLU(True),
         )
 
-        # Up 2: 128 -> 128 (upsample), then concat with 64, then conv to 64
+        # Upsampling stage 2:
+        # Upsample 128 channels to match x0 resolution, concatenate skip from x0 (64),
+        # then reduce to 64 channels.
         if no_antialias_up:
             self.up2_up = nn.ConvTranspose2d(
                 ngf * 2, ngf * 2,
@@ -402,7 +526,7 @@ class ResnetUNetGenerator(nn.Module):
             nn.ReLU(True),
         )
 
-        # Final output conv: c7s1-3 + tanh
+        # Final mapping to RGB with tanh to produce [-1, 1] range
         self.outc = nn.Sequential(
             nn.ReflectionPad2d(3),
             nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0),
@@ -410,44 +534,62 @@ class ResnetUNetGenerator(nn.Module):
         )
 
     def forward(self, x, layers=None, encode_only=False):
-        # We ignore layers/encode_only for simplicity; keep API compatible.
+        """
+        Forward pass.
+
+        The layers/encode_only parameters are included to keep the call signature compatible
+        with some CUT-style code patterns, but they are not used here.
+        """
+        # Encoder
         x0 = self.inc(x)           # (B, 64, H, W)
-        x1 = self.down1(x0)        # (B, 128, H/2, W/2) or H, if no_antialias first
+        x1 = self.down1(x0)        # (B, 128, H/2, W/2) if stride-2, otherwise same
         if self.down1_down is not None:
             x1 = self.down1_down(x1)  # (B, 128, H/2, W/2)
 
-        x2 = self.down2(x1)        # (B, 256, H/4, W/4) or etc.
+        x2 = self.down2(x1)        # (B, 256, H/4, W/4)
         if self.down2_down is not None:
             x2 = self.down2_down(x2)  # (B, 256, H/4, W/4)
 
-        x3 = self.resblocks(x2)    # bottleneck: (B, 256, H/4, W/4)
+        # Bottleneck
+        x3 = self.resblocks(x2)    # (B, 256, H/4, W/4)
 
-        y = self.up1_up(x3)        # (B, 256, H/2, W/2)
-        # skip from x1
+        # Decoder stage 1 (skip from x1)
+        y = self.up1_up(x3)        # (B, 256, approx H/2, approx W/2)
         if y.shape[-2:] != x1.shape[-2:]:
             y = F.interpolate(y, size=x1.shape[-2:], mode='bilinear', align_corners=True)
         y = torch.cat([y, x1], dim=1)   # (B, 256+128, H/2, W/2)
         y = self.up1_conv(y)            # (B, 128, H/2, W/2)
 
-        y = self.up2_up(y)              # (B, 128, H, W)
-        # skip from x0
+        # Decoder stage 2 (skip from x0)
+        y = self.up2_up(y)              # (B, 128, approx H, approx W)
         if y.shape[-2:] != x0.shape[-2:]:
             y = F.interpolate(y, size=x0.shape[-2:], mode='bilinear', align_corners=True)
         y = torch.cat([y, x0], dim=1)   # (B, 128+64, H, W)
         y = self.up2_conv(y)            # (B, 64, H, W)
 
-        out = self.outc(y)              # (B, 3, H, W)
+        # Output
+        out = self.outc(y)              # (B, 3, H, W) in [-1, 1]
         return out, None
 
 
 # =========================================================
-# 5) PatchGAN Discriminator
+# 5) Discriminator: PatchGAN
 # =========================================================
 
 class NLayerDiscriminator(nn.Module):
+    """
+    PatchGAN discriminator.
+
+    It predicts a grid of real/fake scores (one score per patch) rather than a single scalar.
+    This helps enforce local realism and sharpness.
+
+    Input: concatenation of IR (1ch) and RGB (3ch) => total 4 channels during training.
+    """
     def __init__(self, input_nc, ndf=64, n_layers=3,
                  norm_layer=nn.InstanceNorm2d):
         super().__init__()
+
+        # Bias usage depends on normalization choice
         if isinstance(norm_layer, functools.partial):
             use_bias = (norm_layer.func == nn.InstanceNorm2d)
         else:
@@ -455,10 +597,14 @@ class NLayerDiscriminator(nn.Module):
 
         kw = 4
         padw = 1
+
+        # First layer: conv + LeakyReLU (no normalization)
         sequence = [
             nn.Conv2d(input_nc, ndf, kernel_size=kw, stride=2, padding=padw),
             nn.LeakyReLU(0.2, True),
         ]
+
+        # Middle layers: progressively increase channel depth
         nf_mult = 1
         nf_mult_prev = 1
         for n in range(1, n_layers):
@@ -470,6 +616,8 @@ class NLayerDiscriminator(nn.Module):
                 norm_layer(ndf * nf_mult),
                 nn.LeakyReLU(0.2, True),
             ]
+
+        # Penultimate layer: stride 1 for finer patch resolution
         nf_mult_prev = nf_mult
         nf_mult = min(2 ** n_layers, 8)
         sequence += [
@@ -478,6 +626,8 @@ class NLayerDiscriminator(nn.Module):
             norm_layer(ndf * nf_mult),
             nn.LeakyReLU(0.2, True),
         ]
+
+        # Final layer: output 1-channel patch score map
         sequence += [
             nn.Conv2d(ndf * nf_mult, 1, kernel_size=kw, stride=1, padding=padw)
         ]
@@ -489,46 +639,58 @@ class NLayerDiscriminator(nn.Module):
 
 
 # =========================================================
-# 6) Perceptual loss (VGG-16) + TV loss
+# 6) Perceptual loss (VGG-16) + Total Variation loss
 # =========================================================
 
 class VGGPerceptual(nn.Module):
     """
-    Uses VGG-16 pretrained on ImageNet.
-    Input is expected in [-1,1]; it is converted to [0,1] and normalized.
+    Perceptual feature extractor using VGG-16 pretrained on ImageNet.
+
+    Expected input:
+      - x is Bx3xHxW in [-1, 1]
+    Processing:
+      - Convert to [0, 1]
+      - Apply ImageNet mean/std normalization
+      - Extract early/mid-level features
+
+    This module is used to compute an L1 distance in feature space between prediction and target.
     """
     def __init__(self, device):
         super().__init__()
-        # torchvision >= 0.13 style weights API
+        # Torchvision weights API (with fallback for older versions)
         try:
             vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
         except AttributeError:
-            # older version fallback
             vgg = models.vgg16(pretrained=True)
 
-        # up to relu3_3 (approx. features[:16])
+        # Use features up to relu3_3 (approximately features[:16])
         self.features = nn.Sequential(*list(vgg.features.children())[:16]).to(device)
+
+        # Freeze parameters (no gradient updates)
         for p in self.features.parameters():
             p.requires_grad = False
         self.features.eval()
 
-        # ImageNet normalization
+        # ImageNet normalization buffers (broadcastable)
         mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         self.register_buffer("mean", mean)
         self.register_buffer("std", std)
 
     def forward(self, x):
-        # x: Bx3xHxW in [-1,1]
-        x = (x + 1.0) / 2.0  # to [0,1]
+        # x: Bx3xHxW in [-1,1] -> [0,1]
+        x = (x + 1.0) / 2.0
+
+        # Normalize for VGG
         x = (x - self.mean) / self.std
         return self.features(x)
 
 
 def tv_loss(x):
     """
-    Total variation loss, encouraging spatial smoothness.
-    x: BxCxHxW
+    Total variation loss encourages spatial smoothness in the output.
+
+    It penalizes absolute differences between neighboring pixels horizontally and vertically.
     """
     diff_i = torch.mean(torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :]))
     diff_j = torch.mean(torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]))
@@ -536,13 +698,19 @@ def tv_loss(x):
 
 
 # =========================================================
-# 7) IRColorizationModel wrapper
+# 7) Model wrapper (generator only for inference; generator+discriminator for training)
 # =========================================================
 
 class IRColorizationModel(nn.Module):
+    """
+    Lightweight wrapper that holds the generator network and provides:
+      - weight loading
+      - forward method for IR -> RGB
+    """
     def __init__(self, cfg: Config):
         super().__init__()
         norm_layer = get_norm_layer(cfg.norm)
+
         self.netG = ResnetUNetGenerator(
             cfg.input_nc, cfg.output_nc, cfg.ngf,
             norm_layer=norm_layer,
@@ -552,26 +720,42 @@ class IRColorizationModel(nn.Module):
             no_antialias=cfg.no_antialias,
             no_antialias_up=cfg.no_antialias_up,
         )
+
         self.device = torch.device(cfg.device)
         self.netG = init_net(self.netG, init_type='normal', init_gain=0.02,
                              device=self.device, initialize_weights=True)
 
     def load_weights(self, path):
+        """
+        Load generator weights from a checkpoint.
+        Supports either a raw state_dict or a dict containing 'state_dict'.
+        """
         state = torch.load(path, map_location=self.device)
         if isinstance(state, dict) and 'state_dict' in state:
             state = state['state_dict']
         self.netG.load_state_dict(state, strict=False)
 
     def forward(self, ir_tensor):
+        """
+        Forward IR tensor (Bx1xHxW in [-1,1]) through generator to produce RGB (Bx3xHxW in [-1,1]).
+        """
         fake_b, _ = self.netG(ir_tensor)
         return fake_b
 
 
 # =========================================================
-# 8) Inference helpers
+# 8) Inference utilities (image I/O, tensor conversion)
 # =========================================================
 
 def load_ir_image(path, img_size=None):
+    """
+    Load a grayscale IR image from disk.
+
+    Returns:
+      - HxW float32 in [0, 1]
+
+    If img_size is provided, the image is resized to (img_size, img_size).
+    """
     img_u8 = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img_u8 is None:
         raise RuntimeError(f"Could not read image: {path}")
@@ -581,28 +765,44 @@ def load_ir_image(path, img_size=None):
         img_u8 = cv2.resize(img_u8, (img_size, img_size), interpolation=cv2.INTER_AREA)
 
     img = img_u8.astype(np.float32)
+
+    # Handle both 8-bit and 16-bit sources
     if img.max() > 1.0:
         if orig_dtype == np.uint8:
             img /= 255.0
         else:
             img /= 65535.0
+
     img = np.clip(img, 0.0, 1.0)
     return img
 
 
 def load_rgb_image(path, img_size=None):
+    """
+    Load a color (RGB) image from disk.
+
+    Returns:
+      - HxWx3 float32 in [0, 1]
+
+    If img_size is provided, the image is resized to (img_size, img_size).
+    """
     img = cv2.imread(path, cv2.IMREAD_COLOR)
     if img is None:
         raise RuntimeError(f"Could not read RGB image: {path}")
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
     if img_size is not None:
         img = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_AREA)
+
     img = img.astype(np.float32) / 255.0
     img = np.clip(img, 0.0, 1.0)
     return img
 
 
 def ir_to_tensor(img_hw):
+    """
+    Convert a grayscale IR image in [0,1] (HxW) to a torch tensor in [-1,1] (1x1xHxW).
+    """
     img = img_hw[None, None, :, :]
     img = torch.from_numpy(img).float()
     img = img * 2.0 - 1.0
@@ -610,6 +810,11 @@ def ir_to_tensor(img_hw):
 
 
 def tensor_to_rgb_image(tensor_bchw):
+    """
+    Convert a generated RGB tensor in [-1,1] (Bx3xHxW) to a uint8 image (HxWx3) in [0,255].
+
+    Only the first element of the batch is converted.
+    """
     x = tensor_bchw[0].detach().cpu().numpy()
     x = (x + 1.0) / 2.0
     x = np.clip(x, 0.0, 1.0)
@@ -619,88 +824,257 @@ def tensor_to_rgb_image(tensor_bchw):
 
 
 def save_rgb(path, img_rgb):
+    """
+    Save an RGB uint8 image (HxWx3) to disk using PIL.
+    Creates parent directories if needed.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     Image.fromarray(img_rgb).save(path)
 
 
 def collect_images(input_dir):
+    """
+    Collect image file paths directly under input_dir (non-recursive).
+    """
     exts = ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tif', '*.tiff']
     files = []
     for ext in exts:
         files.extend(glob(os.path.join(input_dir, ext)))
-    files = sorted(files)
-    return files
+    return sorted(files)
+
+
+def collect_kaist_ir_files_from_sets(set_roots):
+    """
+    Recursively scan KAIST set directories and collect IR files under any 'lwir' folder.
+
+    For each discovered IR file, record:
+      - ir_path: absolute path to the IR image
+      - set_name: the set folder name (e.g., set02)
+      - seq_rel : the relative sequence path from the set root (e.g., V000 or deeper)
+
+    Only 'lwir' folders that have a sibling 'visible' folder are considered valid.
+    """
+    if isinstance(set_roots, (str, bytes)):
+        set_roots = [set_roots]
+
+    exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
+    entries = []
+
+    def list_imgs(folder):
+        if not os.path.isdir(folder):
+            return []
+        files = []
+        for fn in os.listdir(folder):
+            if fn.lower().endswith(exts):
+                files.append(os.path.join(folder, fn))
+        return sorted(files)
+
+    for root in set_roots:
+        if not os.path.isdir(root):
+            print(f"[WARN] set root not found: {root}")
+            continue
+
+        set_name = os.path.basename(root.rstrip("\\/"))
+
+        # Walk the directory tree to find any folder named 'lwir'
+        for dirpath, dirnames, filenames in os.walk(root):
+            if os.path.basename(dirpath).lower() != "lwir":
+                continue
+
+            lwir_dir = dirpath
+            seq_dir = os.path.dirname(lwir_dir)        # .../<sequence>
+            vis_dir = os.path.join(seq_dir, "visible") # .../<sequence>/visible
+
+            if not os.path.isdir(vis_dir):
+                continue
+
+            ir_files = list_imgs(lwir_dir)
+            if len(ir_files) == 0:
+                continue
+
+            seq_rel = os.path.relpath(seq_dir, root)
+
+            for ir_path in ir_files:
+                entries.append((ir_path, set_name, seq_rel))
+
+    return entries
+
+
+def float01_to_uint8_rgb(img01_hw_or_hwc):
+    """
+    Convert:
+      - HxW float [0,1] (grayscale) or
+      - HxWx3 float [0,1] (RGB)
+    into HxWx3 uint8 [0,255].
+
+    If input is grayscale, it is replicated into 3 channels.
+    """
+    x = np.clip(img01_hw_or_hwc, 0.0, 1.0)
+    if x.ndim == 2:
+        x = np.stack([x, x, x], axis=2)
+    x = (x * 255.0).astype(np.uint8)
+    return x
+
+
+def make_comparison_collage(ir01_hw, pred_u8_hwc, gt01_hwc=None,
+                            add_text=True, pad=8,
+                            font_scale=0.6, thickness=2,
+                            metrics_text=None):
+    """
+    Create a side-by-side collage:
+
+      [ IR (gray replicated to RGB) | Pred (RGB) | GT (RGB, optional) ]
+
+    Parameters:
+      - ir01_hw      : HxW float [0,1]
+      - pred_u8_hwc  : HxWx3 uint8
+      - gt01_hwc     : HxWx3 float [0,1] or None
+      - metrics_text : optional string to overlay (e.g., "PSNR=23.1dB SSIM=0.71")
+
+    Returns:
+      - collage image as HxWx3 uint8
+    """
+    ir_u8 = float01_to_uint8_rgb(ir01_hw)
+    pred = pred_u8_hwc
+    imgs = [ir_u8, pred]
+
+    if gt01_hwc is not None:
+        gt_u8 = float01_to_uint8_rgb(gt01_hwc)
+        imgs.append(gt_u8)
+
+    H = imgs[0].shape[0]
+    widths = [im.shape[1] for im in imgs]
+    total_w = sum(widths) + pad * (len(imgs) - 1)
+
+    canvas = np.zeros((H, total_w, 3), dtype=np.uint8)
+
+    x = 0
+    for k, im in enumerate(imgs):
+        canvas[:, x:x + im.shape[1], :] = im
+        x += im.shape[1]
+        if k != len(imgs) - 1:
+            x += pad
+
+    if add_text:
+        # cv2 uses BGR for colors, but on RGB canvas text is still readable.
+        cv2.putText(canvas, "IR", (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+        x_pred = widths[0] + pad + 10
+        cv2.putText(canvas, "Pred", (x_pred, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+        if gt01_hwc is not None:
+            x_gt = widths[0] + pad + widths[1] + pad + 10
+            cv2.putText(canvas, "GT", (x_gt, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                        font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+        if metrics_text is not None:
+            cv2.putText(canvas, metrics_text, (10, H - 12), cv2.FONT_HERSHEY_SIMPLEX,
+                        font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    return canvas
+
+
+def save_comparison_image(cfg, out_rel, collage_u8_hwc):
+    """
+    Save collage under:
+      <output_dir>/<comparison_dirname>/<subdirs>/<stem>_cmp.png
+
+    out_rel is the prediction's relative path, such as:
+      set02/V000/I00001.jpg
+    """
+    base = os.path.basename(out_rel)
+    stem, _ = os.path.splitext(base)
+    subdir = os.path.dirname(out_rel)
+
+    cmp_dir = os.path.join(cfg.output_dir, cfg.comparison_dirname, subdir)
+    os.makedirs(cmp_dir, exist_ok=True)
+
+    cmp_path = os.path.join(cmp_dir, f"{stem}_cmp.png")
+    Image.fromarray(collage_u8_hwc).save(cmp_path)
+    return cmp_path
 
 
 # =========================================================
-# 9) KAIST Dataset (Vxxx/lwir, Vxxx/visible)
+# 9) KAIST paired dataset loader
 # =========================================================
 
 class KAISTPairDataset(Dataset):
     """
-    Expected structure:
-    root/
-      V000/
-        lwir/
-        visible/
-      V001/
-        lwir/
-        visible/
-      ...
-    All Vxxx folders are scanned and IR-RGB pairs are collected.
-    'indices' is used to select a subset for train/validation splits.
+    KAIST IR-RGB paired dataset loader (recursive).
+
+    It scans each root directory and finds folders named:
+      - lwir     (IR images)
+      - visible  (RGB images)
+
+    Pairing logic:
+      - Within each (sequence) folder, it matches IR and RGB images by filename intersection.
+      - Each sample yields:
+          {'ir': 1xHxW tensor in [-1,1],
+           'rgb': 3xHxW tensor in [-1,1]}
+
+    Augmentations:
+      - Random horizontal flip (applied consistently to both IR and RGB).
     """
     def __init__(self, root, img_size=256, augment=True, indices=None):
         super().__init__()
-        self.root = root
         self.img_size = img_size
         self.augment = augment
 
+        if isinstance(root, (list, tuple)):
+            roots = list(root)
+        else:
+            roots = [root]
+
+        exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
         all_ir = []
         all_rgb = []
 
-        # Also support the case where root has direct 'lwir' & 'visible' folders
-        direct_ir_dir = os.path.join(root, 'lwir')
-        direct_rgb_dir = os.path.join(root, 'visible')
-        if os.path.isdir(direct_ir_dir) and os.path.isdir(direct_rgb_dir):
-            seq_dirs = [root]
-        else:
-            # Subfolders: V000, V001, ...
+        def list_imgs_map(folder):
+            """Return dict: filename -> full path for image files under folder."""
+            m = {}
+            if not os.path.isdir(folder):
+                return m
+            for fn in os.listdir(folder):
+                if fn.lower().endswith(exts):
+                    m[fn] = os.path.join(folder, fn)
+            return m
 
-            seq_dirs = [
-                os.path.join(root, d)
-                for d in sorted(os.listdir(root))
-                if os.path.isdir(os.path.join(root, d))
-            ]
+        def scan_one_root(one_root):
+            if not os.path.isdir(one_root):
+                return
 
-        for seq in seq_dirs:
-            ir_dir = os.path.join(seq, 'lwir')
-            rgb_dir = os.path.join(seq, 'visible')
-            if not (os.path.isdir(ir_dir) and os.path.isdir(rgb_dir)):
-                continue
+            for dirpath, dirnames, filenames in os.walk(one_root):
+                if os.path.basename(dirpath).lower() != "lwir":
+                    continue
 
-            ir_files = []
-            rgb_files = []
-            for ext in ['*.png', '*.jpg', '*.jpeg', '*.bmp']:
-                ir_files.extend(glob(os.path.join(ir_dir, ext)))
-                rgb_files.extend(glob(os.path.join(rgb_dir, ext)))
+                lwir_dir = dirpath
+                seq_dir = os.path.dirname(lwir_dir)
+                vis_dir = os.path.join(seq_dir, "visible")
+                if not os.path.isdir(vis_dir):
+                    continue
 
-            ir_files = sorted(ir_files)
-            rgb_files = sorted(rgb_files)
+                ir_map = list_imgs_map(lwir_dir)
+                rgb_map = list_imgs_map(vis_dir)
+                if len(ir_map) == 0 or len(rgb_map) == 0:
+                    continue
 
-            if len(ir_files) == 0 or len(rgb_files) == 0:
-                continue
-            if len(ir_files) != len(rgb_files):
-                print(f"[WARN] In seq {seq}: IR({len(ir_files)}) != RGB({len(rgb_files)}), skipping this seq.")
-                continue
+                common = sorted(set(ir_map.keys()) & set(rgb_map.keys()))
+                if len(common) == 0:
+                    continue
 
-            all_ir.extend(ir_files)
-            all_rgb.extend(rgb_files)
+                for fn in common:
+                    all_ir.append(ir_map[fn])
+                    all_rgb.append(rgb_map[fn])
+
+        for r in roots:
+            scan_one_root(r)
 
         if len(all_ir) == 0:
-            raise RuntimeError(f"No IR-RGB pairs found under {root}")
+            raise RuntimeError(f"No IR-RGB pairs found under roots: {roots}")
 
-        # If indices are given, select a subset (for train/val split)
+        # Apply an index subset if provided (used for train/val split)
         if indices is not None:
             self.ir_paths = [all_ir[i] for i in indices]
             self.rgb_paths = [all_rgb[i] for i in indices]
@@ -714,6 +1088,7 @@ class KAISTPairDataset(Dataset):
         return len(self.ir_paths)
 
     def _read_ir(self, path):
+        """Read IR grayscale image, resize, and return float [0,1]."""
         img_u8 = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
         if img_u8 is None:
             raise RuntimeError(f"Could not read IR image: {path}")
@@ -731,6 +1106,7 @@ class KAISTPairDataset(Dataset):
         return img
 
     def _read_rgb(self, path):
+        """Read RGB image, resize, and return float [0,1] with RGB channel order."""
         img = cv2.imread(path, cv2.IMREAD_COLOR)
         if img is None:
             raise RuntimeError(f"Could not read RGB image: {path}")
@@ -744,42 +1120,54 @@ class KAISTPairDataset(Dataset):
         ir = self._read_ir(self.ir_paths[idx])
         rgb = self._read_rgb(self.rgb_paths[idx])
 
-        # Simple geometric augmentation: horizontal flip
+        # Simple paired augmentation: horizontal flip
         if self.augment and random.random() < 0.5:
             ir = np.fliplr(ir).copy()
             rgb = np.fliplr(rgb).copy()
 
+        # Convert to tensors
         ir_t = torch.from_numpy(ir).unsqueeze(0)                 # 1 x H x W
         rgb_t = torch.from_numpy(np.transpose(rgb, (2, 0, 1)))   # 3 x H x W
 
+        # Normalize to [-1,1] for tanh-based generator
         ir_t = ir_t * 2.0 - 1.0
         rgb_t = rgb_t * 2.0 - 1.0
-
         return {'ir': ir_t, 'rgb': rgb_t}
 
 
 # =========================================================
-# 10) Test (inference) mode + metrics
+# 10) Evaluation: inference + metrics + saving
 # =========================================================
 
 def compute_metrics(pred_01, gt_01):
     """
-    pred_01, gt_01: HxWx3 float32 images in [0,1].
-    Returns: mae, mse, psnr, ssim_val
+    Compute basic image quality metrics between prediction and ground-truth.
+
+    Inputs:
+      - pred_01, gt_01: HxWx3 float32 images in [0,1]
+
+    Returns:
+      - mae : mean absolute error
+      - mse : mean squared error
+      - psnr: peak signal-to-noise ratio (computed from MSE assuming peak=1.0)
+      - ssim_val: structural similarity index (None if scikit-image is unavailable)
     """
     diff = pred_01 - gt_01
     mae = float(np.mean(np.abs(diff)))
     mse = float(np.mean(diff ** 2))
+
+    # PSNR definition using peak=1.0
     if mse == 0:
         psnr = float('inf')
     else:
         psnr = 20.0 * math.log10(1.0) - 10.0 * math.log10(mse + 1e-12)
 
+    # SSIM (optional)
     if HAVE_SKIMAGE:
         try:
             ssim_val = float(ssim(gt_01, pred_01, data_range=1.0, channel_axis=2))
         except TypeError:
-            # Fallback for older scikit-image versions
+            # Older scikit-image versions use multichannel=True
             ssim_val = float(ssim(gt_01, pred_01, data_range=1.0, multichannel=True))
     else:
         ssim_val = None
@@ -789,22 +1177,28 @@ def compute_metrics(pred_01, gt_01):
 
 def save_best_k_outputs(cfg: Config, metrics_list):
     """
-    Copies best-K colored images from cfg.output_dir into:
-        cfg.output_dir / cfg.best50_dirname
+    Copy the top-K outputs (best quality) into a dedicated folder.
+
     Ranking metric:
-      - SSIM if available, else PSNR
-    Also writes a ranking file.
+      - Use SSIM if available and computed
+      - Otherwise use PSNR
+
+    Files copied:
+      - Predictions (colored images) into: <output_dir>/<best50_dirname>/<colored_subdir>/
+      - Collages into: <output_dir>/<best50_dirname>/<collages_subdir>/
+
+    A ranking CSV is also written to document the ordering and metric values.
     """
     if not metrics_list:
-        print("[TOP-K] metrics_list empty, skipping best-K save.")
+        print("[TOP-K] metrics_list empty, skipping top-K save.")
         return
 
-    # Prefer SSIM if available and present
     if HAVE_SKIMAGE and any(m.get("ssim") is not None for m in metrics_list):
         metric_key = "ssim"
     else:
         metric_key = "psnr"
 
+    # Filter invalid entries for the selected metric
     valid = []
     for m in metrics_list:
         v = m.get(metric_key, None)
@@ -815,18 +1209,25 @@ def save_best_k_outputs(cfg: Config, metrics_list):
         valid.append(m)
 
     if not valid:
-        print(f"[TOP-K] No valid '{metric_key}' values, skipping best-K save.")
+        print(f"[TOP-K] No valid '{metric_key}' values, skipping top-K save.")
         return
 
+    # Sort descending: higher is better
     valid.sort(key=lambda x: x[metric_key], reverse=True)
     top_k = valid[:max(1, int(cfg.topk))]
 
     best_dir = os.path.join(cfg.output_dir, cfg.best50_dirname)
     os.makedirs(best_dir, exist_ok=True)
 
+    preds_sub = os.path.join(best_dir, getattr(cfg, "best50_preds_subdir", "colored"))
+    colls_sub = os.path.join(best_dir, getattr(cfg, "best50_collages_subdir", "collages"))
+    os.makedirs(preds_sub, exist_ok=True)
+    os.makedirs(colls_sub, exist_ok=True)
+
+    # Ranking CSV
     rank_path = os.path.join(best_dir, f"top_{len(top_k)}_ranking.csv")
     with open(rank_path, "w", encoding="utf-8") as f:
-        f.write(f"rank,file,mae,mse,psnr,ssim,metric_used\n")
+        f.write("rank,file,mae,mse,psnr,ssim,metric_used\n")
         for r, m in enumerate(top_k, start=1):
             ssim_val = m.get("ssim", None)
             ssim_str = "" if ssim_val is None else f"{ssim_val:.6f}"
@@ -834,22 +1235,68 @@ def save_best_k_outputs(cfg: Config, metrics_list):
                 f"{r},{m['file']},{m['mae']:.8f},{m['mse']:.8f},{m['psnr']:.6f},{ssim_str},{metric_key}\n"
             )
 
-    copied = 0
-    for m in top_k:
-        fname = m["file"]
-        src = os.path.join(cfg.output_dir, fname)
-        dst = os.path.join(best_dir, fname)
-        if os.path.isfile(src):
-            shutil.copy2(src, dst)
-            copied += 1
-        else:
-            print(f"[TOP-K][WARN] Missing output file, cannot copy: {src}")
+    copy_preds = getattr(cfg, "best50_copy_preds", True)
+    copy_colls = getattr(cfg, "best50_copy_collages", True)
 
-    print(f"[TOP-K] Saved best {copied}/{len(top_k)} outputs to: {best_dir}")
-    print(f"[TOP-K] Ranking file: {rank_path}")
+    copied_preds = 0
+    copied_colls = 0
+
+    for m in top_k:
+        rel_id = m["file"]  # e.g., set02/V000/I00001.jpg
+        rel_norm = rel_id.replace("\\", "/")
+        subdir = os.path.dirname(rel_norm)          # e.g., set02/V000
+        base = os.path.basename(rel_norm)           # e.g., I00001.jpg
+        stem, _ = os.path.splitext(base)
+
+        # Flatten name to avoid collisions across folders
+        flat_base = rel_norm.replace("/", "__")     # e.g., set02__V000__I00001.jpg
+        flat_stem = os.path.splitext(flat_base)[0]  # e.g., set02__V000__I00001
+
+        # 1) Copy prediction image
+        if copy_preds:
+            src_pred = os.path.join(cfg.output_dir, rel_id)
+            dst_pred = os.path.join(preds_sub, flat_base)
+            if os.path.isfile(src_pred):
+                shutil.copy2(src_pred, dst_pred)
+                copied_preds += 1
+            else:
+                print(f"[TOP-K][WARN] Missing prediction, cannot copy: {src_pred}")
+
+        # 2) Copy collage image
+        if copy_colls:
+            # Collage path convention:
+            #   <output_dir>/<comparison_dirname>/<set>/<seq>/<stem>_cmp.png
+            src_cmp = os.path.join(cfg.output_dir, cfg.comparison_dirname, subdir, f"{stem}_cmp.png")
+
+            # If saved with a different extension, try jpg
+            if not os.path.isfile(src_cmp):
+                src_cmp_jpg = os.path.join(cfg.output_dir, cfg.comparison_dirname, subdir, f"{stem}_cmp.jpg")
+                if os.path.isfile(src_cmp_jpg):
+                    src_cmp = src_cmp_jpg
+
+            dst_cmp = os.path.join(colls_sub, f"{flat_stem}__cmp.png")
+
+            if os.path.isfile(src_cmp):
+                shutil.copy2(src_cmp, dst_cmp)
+                copied_colls += 1
+            else:
+                print(f"[TOP-K][WARN] Missing collage, cannot copy: {src_cmp}")
+
+    print(f"[TOP-K] Saved best outputs to: {best_dir}")
+    print(f"[TOP-K] Colored copied : {copied_preds}/{len(top_k)} -> {preds_sub}")
+    print(f"[TOP-K] Collage copied : {copied_colls}/{len(top_k)} -> {colls_sub}")
+    print(f"[TOP-K] Ranking file   : {rank_path}")
 
 
 def run_test(cfg: Config):
+    """
+    Inference runner:
+      - Loads generator weights (if available)
+      - Scans KAIST test sets (cfg.test_roots)
+      - Saves prediction images in a mirrored folder structure
+      - Computes metrics where GT exists
+      - Saves collages and top-K best results
+    """
     device = torch.device(cfg.device)
     print(f"[TEST] Device: {device}")
 
@@ -866,24 +1313,17 @@ def run_test(cfg: Config):
               "generator is randomly initialized, results will be meaningless.")
 
     model.eval()
-
-    img_paths = collect_images(cfg.input_dir)
-    print(f"Found {len(img_paths)} IR images in {cfg.input_dir}")
-
     os.makedirs(cfg.output_dir, exist_ok=True)
 
-    # Assume visible GT is in sibling 'visible' folder next to 'lwir'
-    ir_dir = cfg.input_dir
-    if os.path.basename(ir_dir).lower() == "lwir":
-        vis_dir = os.path.join(os.path.dirname(ir_dir), "visible")
+    # Prefer scanning test_roots recursively; fallback to single input_dir if test_roots is empty
+    if hasattr(cfg, "test_roots") and cfg.test_roots:
+        entries = collect_kaist_ir_files_from_sets(cfg.test_roots)
+        print(f"Found {len(entries)} IR images across test sets: {cfg.test_roots}")
     else:
-        vis_dir = ir_dir.replace("lwir", "visible")
+        img_paths = collect_images(cfg.input_dir)
+        entries = [(p, "input_dir", "seq") for p in img_paths]
+        print(f"Found {len(entries)} IR images in {cfg.input_dir}")
 
-    if not os.path.isdir(vis_dir):
-        print(f"WARNING: visible directory not found at: {vis_dir}")
-        print("Metrics will be skipped (no ground truth RGB found).")
-
-    # Metrics accumulation
     metrics_list = []
     sum_mae = 0.0
     sum_mse = 0.0
@@ -896,28 +1336,46 @@ def run_test(cfg: Config):
     best_ssim = -1.0
     best_ssim_sample = None
 
-    for idx, path in enumerate(img_paths, start=1):
-        ir = load_ir_image(path, img_size=cfg.img_size)
+    for idx, (ir_path, set_name, seq_name) in enumerate(entries, start=1):
+        # Load IR and convert to model tensor
+        ir = load_ir_image(ir_path, img_size=cfg.img_size)
         ir_tensor = ir_to_tensor(ir).to(device)
 
+        # Run generator
         with torch.no_grad():
             fake_rgb = model(ir_tensor)
 
-        fake_rgb_np = tensor_to_rgb_image(fake_rgb)  # uint8, HxWx3, [0..255]
-        base = os.path.basename(path)
-        out_path = os.path.join(cfg.output_dir, base)
+        # Convert output to uint8 RGB image
+        fake_rgb_np = tensor_to_rgb_image(fake_rgb)
+        base = os.path.basename(ir_path)
+
+        # Save prediction:
+        #   <output_dir>/<set_name>/<seq_rel>/<filename>
+        out_rel = os.path.join(set_name, seq_name, base)
+        out_path = os.path.join(cfg.output_dir, out_rel)
         save_rgb(out_path, fake_rgb_np)
 
-        # Metrics: only if GT exists
+        # Locate GT RGB:
+        # IR: .../<seq>/lwir/<file>
+        # GT: .../<seq>/visible/<file>
+        lwir_dir = os.path.dirname(ir_path)
+        seq_dir = os.path.dirname(lwir_dir)
+        vis_dir = os.path.join(seq_dir, "visible")
         gt_path = os.path.join(vis_dir, base)
+
+        gt_rgb_01 = None
+        mae = mse = psnr_val = None
+        ssim_val = None
+
+        # Compute metrics only if GT exists
         if os.path.isdir(vis_dir) and os.path.isfile(gt_path):
-            gt_rgb_01 = load_rgb_image(gt_path, img_size=cfg.img_size)   # [0,1] float
-            pred_rgb_01 = fake_rgb_np.astype(np.float32) / 255.0         # [0,1] float
+            gt_rgb_01 = load_rgb_image(gt_path, img_size=cfg.img_size)
+            pred_rgb_01 = fake_rgb_np.astype(np.float32) / 255.0
 
             mae, mse, psnr_val, ssim_val = compute_metrics(pred_rgb_01, gt_rgb_01)
 
             metrics_list.append({
-                "file": base,
+                "file": out_rel,
                 "mae": mae,
                 "mse": mse,
                 "psnr": psnr_val,
@@ -934,21 +1392,41 @@ def run_test(cfg: Config):
 
             if np.isfinite(psnr_val) and psnr_val > best_psnr:
                 best_psnr = psnr_val
-                best_psnr_sample = base
+                best_psnr_sample = out_rel
             if ssim_val is not None and ssim_val > best_ssim:
                 best_ssim = ssim_val
-                best_ssim_sample = base
-
+                best_ssim_sample = out_rel
         else:
             if os.path.isdir(vis_dir):
                 print(f"[WARN] No GT RGB found for {base} at {gt_path}; metrics skipped for this image.")
 
-        if idx % 10 == 0 or idx == len(img_paths):
-            print(f"[{idx}/{len(img_paths)}] {path} -> {out_path}")
+        # Save side-by-side collage if enabled
+        if hasattr(cfg, "save_comparisons") and cfg.save_comparisons:
+            metrics_text = None
+            if (psnr_val is not None) and (ssim_val is not None):
+                metrics_text = f"PSNR={psnr_val:.2f}dB  SSIM={ssim_val:.4f}"
+            elif (psnr_val is not None):
+                metrics_text = f"PSNR={psnr_val:.2f}dB"
+
+            collage = make_comparison_collage(
+                ir01_hw=ir,
+                pred_u8_hwc=fake_rgb_np,
+                gt01_hwc=gt_rgb_01,
+                add_text=getattr(cfg, "comparison_add_text", True),
+                pad=getattr(cfg, "comparison_pad", 8),
+                font_scale=getattr(cfg, "comparison_font_scale", 0.6),
+                thickness=getattr(cfg, "comparison_thickness", 2),
+                metrics_text=metrics_text
+            )
+            _ = save_comparison_image(cfg, out_rel, collage)
+
+        # Periodic progress logging
+        if idx % 50 == 0 or idx == len(entries):
+            print(f"[{idx}/{len(entries)}] {ir_path} -> {out_path}")
 
     print("Test finished.")
 
-    # Write metrics to file
+    # Summarize metrics over all samples where GT was available
     if count > 0:
         mean_mae = sum_mae / count
         mean_mse = sum_mse / count
@@ -964,15 +1442,13 @@ def run_test(cfg: Config):
             print(f"Mean SSIM  : {mean_ssim:.6f}")
         else:
             print("Mean SSIM  : None (scikit-image not installed)")
-        if best_psnr_sample is not None:
-            print(f"Best PSNR  : {best_psnr:.4f} ({best_psnr_sample})")
-        else:
-            print("Best PSNR  : N/A")
+        print(f"Best PSNR  : {best_psnr:.4f} ({best_psnr_sample})" if best_psnr_sample else "Best PSNR  : N/A")
         if HAVE_SKIMAGE and best_ssim_sample is not None:
             print(f"Best SSIM  : {best_ssim:.6f} ({best_ssim_sample})")
         else:
             print("Best SSIM  : N/A")
 
+        # Write per-image metrics to CSV
         metrics_path = os.path.join(cfg.output_dir, "metrics_test.csv")
         with open(metrics_path, "w", encoding="utf-8") as f:
             f.write("file,mae,mse,psnr,ssim\n")
@@ -992,22 +1468,27 @@ def run_test(cfg: Config):
 
         print(f"\nMetrics saved to: {metrics_path}")
 
-        # --------- Save Best-50 colored outputs ----------
+        # Copy top-K results
         save_best_k_outputs(cfg, metrics_list)
-
     else:
         print("No metrics were computed (no matching GT RGB images found).")
 
 
 # =========================================================
-# 11) Validation (L1 only)
+# 11) Validation helper (L1 only)
 # =========================================================
 
 def validate_kaist(model: IRColorizationModel, val_loader, device):
+    """
+    Compute validation loss using only pixel-wise L1 distance.
+
+    This keeps validation fast and stable, while training may include GAN, perceptual, and TV terms.
+    """
     model.eval()
     l1 = nn.L1Loss()
     total_loss = 0.0
     count = 0
+
     with torch.no_grad():
         for batch in val_loader:
             ir = batch['ir'].to(device)
@@ -1016,38 +1497,54 @@ def validate_kaist(model: IRColorizationModel, val_loader, device):
             loss = l1(fake, rgb)
             total_loss += loss.item() * ir.size(0)
             count += ir.size(0)
+
     model.train()
     return total_loss / max(count, 1)
 
 
 # =========================================================
-# 12) Train loop (Pix2Pix-style LSGAN + L1 + Perceptual + TV)
+# 12) Training loop (LSGAN + L1 + Perceptual + TV)
 # =========================================================
 
 def train_kaist(cfg: Config):
+    """
+    Train a Pix2Pix-style model:
+      - Generator: ResnetUNetGenerator
+      - Discriminator: PatchGAN (NLayerDiscriminator)
+      - GAN loss: LSGAN (MSELoss)
+      - Reconstruction loss: L1
+      - Perceptual loss: L1 on VGG features
+      - Regularization: total variation loss
+
+    Checkpoints:
+      - Periodic generator checkpoints under cfg.save_dir
+      - Best generator checkpoint tracked by validation L1
+    """
     device = torch.device(cfg.device)
     print(f"[TRAIN] Device: {device}")
     print(f"KAIST root (V000, V001, ...): {cfg.kaist_root}")
 
-    # Collect the full dataset first
-    base_dataset = KAISTPairDataset(cfg.kaist_root, img_size=cfg.img_size,
-                                    augment=False, indices=None)
+    # Build the full dataset once to obtain a consistent index list for splitting
+    base_dataset = KAISTPairDataset(cfg.train_roots, img_size=cfg.img_size,
+                                   augment=False, indices=None)
+
     N = len(base_dataset)
     val_size = max(1, int(N * cfg.val_ratio))
     train_size = N - val_size
     print(f"Total pairs: {N}, train: {train_size}, val: {val_size}")
 
-    # Shuffle indices and create train/val split
+    # Reproducible shuffle for splitting
     idxs = list(range(N))
     random.seed(42)
     random.shuffle(idxs)
     train_indices = idxs[:train_size]
     val_indices = idxs[train_size:]
 
-    train_dataset = KAISTPairDataset(cfg.kaist_root, img_size=cfg.img_size,
-                                     augment=True, indices=train_indices)
-    val_dataset = KAISTPairDataset(cfg.kaist_root, img_size=cfg.img_size,
-                                   augment=False, indices=val_indices)
+    # Build train/val datasets referencing the same underlying (IR,RGB) pairing
+    train_dataset = KAISTPairDataset(cfg.train_roots, img_size=cfg.img_size,
+                                    augment=True, indices=train_indices)
+    val_dataset = KAISTPairDataset(cfg.train_roots, img_size=cfg.img_size,
+                                  augment=False, indices=val_indices)
 
     train_loader = DataLoader(train_dataset, batch_size=cfg.batch_size,
                               shuffle=True, num_workers=cfg.num_workers,
@@ -1056,14 +1553,16 @@ def train_kaist(cfg: Config):
                             shuffle=False, num_workers=cfg.num_workers,
                             pin_memory=True, drop_last=False)
 
+    # Generator wrapper
     model = IRColorizationModel(cfg)
     if cfg.init_G_weights is not None and os.path.isfile(cfg.init_G_weights):
         print(f"Initializing generator from: {cfg.init_G_weights}")
         model.load_weights(cfg.init_G_weights)
 
+    # Discriminator
     norm_layer = get_norm_layer(cfg.norm)
     netD = NLayerDiscriminator(
-        input_nc=cfg.input_nc + cfg.output_nc,
+        input_nc=cfg.input_nc + cfg.output_nc,  # concat IR(1) + RGB(3)
         ndf=64,
         n_layers=3,
         norm_layer=norm_layer,
@@ -1071,6 +1570,7 @@ def train_kaist(cfg: Config):
     netD = init_net(netD, init_type='normal', init_gain=0.02,
                     device=device, initialize_weights=True)
 
+    # Optimizers
     optimizerG = torch.optim.Adam(model.netG.parameters(),
                                   lr=cfg.lr_G, betas=(cfg.beta1, cfg.beta2))
     optimizerD = torch.optim.Adam(netD.parameters(),
@@ -1081,10 +1581,11 @@ def train_kaist(cfg: Config):
     schedulerG = torch.optim.lr_scheduler.LambdaLR(optimizerG, lr_lambda=lr_lambda)
     schedulerD = torch.optim.lr_scheduler.LambdaLR(optimizerD, lr_lambda=lr_lambda)
 
-    criterionGAN = nn.MSELoss()
+    # Loss functions
+    criterionGAN = nn.MSELoss()  # LSGAN
     criterionL1 = nn.L1Loss()
 
-    # Perceptual loss model (VGG)
+    # Perceptual feature extractor
     vgg_perc = VGGPerceptual(device).to(device)
 
     os.makedirs(cfg.save_dir, exist_ok=True)
@@ -1095,6 +1596,7 @@ def train_kaist(cfg: Config):
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         netD.train()
+
         epoch_g_loss = 0.0
         epoch_d_loss = 0.0
         steps = 0
@@ -1103,43 +1605,58 @@ def train_kaist(cfg: Config):
             ir = batch['ir'].to(device)
             rgb = batch['rgb'].to(device)
 
-            # --- Update Discriminator D ---
+            # -------------------------
+            # Update Discriminator (D)
+            # -------------------------
             optimizerD.zero_grad()
+
+            # Generate fake RGB without gradients to avoid updating G during D step
             with torch.no_grad():
                 fake_rgb = model(ir)
+
+            # Discriminator input is concatenation: [IR, RGB]
             real_input = torch.cat([ir, rgb], dim=1)
             fake_input = torch.cat([ir, fake_rgb], dim=1)
 
             pred_real = netD(real_input)
             pred_fake = netD(fake_input)
 
+            # LSGAN targets
             target_real = torch.ones_like(pred_real)
             target_fake = torch.zeros_like(pred_fake)
 
             loss_D_real = criterionGAN(pred_real, target_real)
             loss_D_fake = criterionGAN(pred_fake, target_fake)
             loss_D = 0.5 * (loss_D_real + loss_D_fake)
+
             loss_D.backward()
             optimizerD.step()
 
-            # --- Update Generator G ---
+            # ----------------------
+            # Update Generator (G)
+            # ----------------------
             optimizerG.zero_grad()
+
             fake_rgb = model(ir)
             fake_input = torch.cat([ir, fake_rgb], dim=1)
             pred_fake = netD(fake_input)
 
-            target_real = torch.ones_like(pred_fake)
-            loss_G_GAN = criterionGAN(pred_fake, target_real)
+            # GAN term: make D believe fake is real
+            target_real_for_G = torch.ones_like(pred_fake)
+            loss_G_GAN = criterionGAN(pred_fake, target_real_for_G)
+
+            # Pixel reconstruction term
             loss_G_L1 = criterionL1(fake_rgb, rgb) * cfg.lambda_L1
 
-            # Perceptual loss
+            # Perceptual term on VGG features
             feat_fake = vgg_perc(fake_rgb)
             feat_real = vgg_perc(rgb)
             loss_G_perc = F.l1_loss(feat_fake, feat_real) * cfg.lambda_perc
 
-            # TV loss
+            # TV regularizer on output
             loss_G_TV = tv_loss(fake_rgb) * cfg.lambda_tv
 
+            # Total generator loss
             loss_G = loss_G_GAN + loss_G_L1 + loss_G_perc + loss_G_TV
             loss_G.backward()
             optimizerG.step()
@@ -1148,6 +1665,7 @@ def train_kaist(cfg: Config):
             epoch_d_loss += loss_D.item()
             steps += 1
 
+            # Log training progress occasionally
             if i % 50 == 0 or i == 1:
                 print(
                     f"Epoch [{epoch}/{cfg.epochs}] Step [{i}/{len(train_loader)}] "
@@ -1156,6 +1674,7 @@ def train_kaist(cfg: Config):
                     f"+ Perc {loss_G_perc.item():.4f} + TV {loss_G_TV.item():.6f})"
                 )
 
+        # End-of-epoch summaries
         avg_g_loss = epoch_g_loss / max(steps, 1)
         avg_d_loss = epoch_d_loss / max(steps, 1)
         val_l1 = validate_kaist(model, val_loader, device)
@@ -1165,17 +1684,17 @@ def train_kaist(cfg: Config):
             f"val L1: {val_l1:.4f}"
         )
 
-        # Save periodic checkpoints
+        # Periodic checkpoint saves
         if (epoch % cfg.save_every == 0) or (epoch == cfg.epochs):
             ckpt_path = os.path.join(cfg.save_dir, f"netG_epoch_{epoch:03d}.pth")
             torch.save(model.netG.state_dict(), ckpt_path)
             print(f"Saved generator checkpoint to {ckpt_path}")
 
-        # Save best model based on validation L1
+        # Best checkpoint by validation L1
         if val_l1 < best_val_l1:
             best_val_l1 = val_l1
             torch.save(model.netG.state_dict(), best_ckpt_path)
-            print(f"New best model saved to {best_ckpt_path} (val L1={best_val_l1:.4f})")
+            print(f"Best model updated: {best_ckpt_path} (val L1={best_val_l1:.4f})")
 
         # Step LR schedulers
         schedulerG.step()
@@ -1187,10 +1706,15 @@ def train_kaist(cfg: Config):
 
 
 # =========================================================
-# 13) main
+# 13) Entry point
 # =========================================================
 
 def main():
+    """
+    Script entry point:
+      - Creates a Config
+      - Runs train or test depending on cfg.mode
+    """
     cfg = Config()
     print("Config mode:", cfg.mode)
 
