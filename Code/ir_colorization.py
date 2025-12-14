@@ -572,14 +572,17 @@ class IRColorizationModel(nn.Module):
 # =========================================================
 
 def load_ir_image(path, img_size=None):
-    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
+    img_u8 = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img_u8 is None:
         raise RuntimeError(f"Could not read image: {path}")
+    orig_dtype = img_u8.dtype
+
     if img_size is not None:
-        img = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_AREA)
-    img = img.astype(np.float32)
+        img_u8 = cv2.resize(img_u8, (img_size, img_size), interpolation=cv2.INTER_AREA)
+
+    img = img_u8.astype(np.float32)
     if img.max() > 1.0:
-        if img.dtype == np.uint8:
+        if orig_dtype == np.uint8:
             img /= 255.0
         else:
             img /= 65535.0
@@ -711,13 +714,16 @@ class KAISTPairDataset(Dataset):
         return len(self.ir_paths)
 
     def _read_ir(self, path):
-        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
+        img_u8 = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if img_u8 is None:
             raise RuntimeError(f"Could not read IR image: {path}")
-        img = cv2.resize(img, (self.img_size, self.img_size), interpolation=cv2.INTER_AREA)
-        img = img.astype(np.float32)
+
+        orig_dtype = img_u8.dtype
+        img_u8 = cv2.resize(img_u8, (self.img_size, self.img_size), interpolation=cv2.INTER_AREA)
+
+        img = img_u8.astype(np.float32)
         if img.max() > 1.0:
-            if img.dtype == np.uint8:
+            if orig_dtype == np.uint8:
                 img /= 255.0
             else:
                 img /= 65535.0
