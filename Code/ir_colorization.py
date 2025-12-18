@@ -96,6 +96,8 @@ class Config:
         self.lambda_L1 = 30.0          # pixel L1 term
         self.lambda_perc = 30.0         # VGG perceptual term
         self.lambda_tv = 1e-4           # total variation term
+        self.lambda_ssim = 2.0
+        self.lambda_gan = 0.1
 
         # DataLoader settings
         self.num_workers = 4
@@ -221,10 +223,10 @@ def get_lr_lambda(cfg: Config):
         # Constant LR phase
         if e <= cfg.lr_decay_start_epoch:
             return 1.0
-
+	else:
         # Decay phase
-        if e >= cfg.epochs:
-            return 0.0
+        	if e >= cfg.epochs:
+            	return 0.0
 
         # Linearly decay from 1.0 to 0.0 between lr_decay_start_epoch and epochs
         frac = float(e - cfg.lr_decay_start_epoch) / float(max(1, cfg.epochs - cfg.lr_decay_start_epoch))
@@ -694,6 +696,62 @@ def tv_loss(x):
     return diff_i + diff_j
 
 
+# ---------- Differentiable SSIM in PyTorch (for training loss) ----------
+
+def _gaussian_window(window_size, sigma, device, dtype):
+    coords = torch.arange(window_size, dtype=dtype, device=device) - (window_size - 1) / 2.0
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    return g
+
+
+def _create_ssim_window(window_size, channel, device, dtype):
+    _1d = _gaussian_window(window_size, sigma=1.5, device=device, dtype=dtype).unsqueeze(1)
+    _2d = _1d @ _1d.t()
+    window = _2d.unsqueeze(0).unsqueeze(0)  # 1x1xKxK
+    window = window.expand(channel, 1, window_size, window_size).contiguous()
+    return window
+
+
+def ssim_loss_torch(img1, img2, window_size=11, size_average=True):
+    """
+    img1, img2: tensors in [0,1], shape BxCxHxW
+    Returns: 1 - SSIM
+    """
+    assert img1.shape == img2.shape, "SSIM images must have the same shape"
+    b, c, h, w = img1.shape
+
+    device = img1.device
+    dtype = img1.dtype
+
+    window = _create_ssim_window(window_size, c, device, dtype)
+
+    mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=c)
+    mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=c)
+
+    mu1_sq = mu1 * mu1
+    mu2_sq = mu2 * mu2
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=window_size // 2, groups=c) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=window_size // 2, groups=c) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=window_size // 2, groups=c) - mu1_mu2
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    if size_average:
+        ssim_val = ssim_map.mean()
+    else:
+        ssim_val = ssim_map.mean(dim=[1, 2, 3])  # B
+
+    # Loss: 1 - SSIM (SSIM in [0,1])
+    return 1.0 - ssim_val
+
+
 # =========================================================
 # 7) Model wrapper (generator only for inference; generator+discriminator for training)
 # =========================================================
@@ -892,6 +950,7 @@ def collect_kaist_ir_files_from_sets(set_roots):
             seq_rel = os.path.relpath(seq_dir, root)
 
             for ir_path in ir_files:
+                base = os.path.basename(ir_path)
                 entries.append((ir_path, set_name, seq_rel))
 
     return entries
@@ -1500,28 +1559,15 @@ def validate_kaist(model: IRColorizationModel, val_loader, device):
 
 
 # =========================================================
-# 12) Training loop (LSGAN + L1 + Perceptual + TV)
+# 12) Train loop (Hinge GAN + L1 + Perceptual + TV + SSIM)
 # =========================================================
 
 def train_kaist(cfg: Config):
-    """
-    Train a Pix2Pix-style model:
-      - Generator: ResnetUNetGenerator
-      - Discriminator: PatchGAN (NLayerDiscriminator)
-      - GAN loss: LSGAN (MSELoss)
-      - Reconstruction loss: L1
-      - Perceptual loss: L1 on VGG features
-      - Regularization: total variation loss
-
-    Checkpoints:
-      - Periodic generator checkpoints under cfg.save_dir
-      - Best generator checkpoint tracked by validation L1
-    """
     device = torch.device(cfg.device)
     print(f"[TRAIN] Device: {device}")
     print(f"KAIST root (V000, V001, ...): {cfg.kaist_root}")
 
-    # Build the full dataset once to obtain a consistent index list for splitting
+    # Collect the full dataset first
     base_dataset = KAISTPairDataset(cfg.train_roots, img_size=cfg.img_size,
                                    augment=False, indices=None)
 
@@ -1578,11 +1624,9 @@ def train_kaist(cfg: Config):
     schedulerG = torch.optim.lr_scheduler.LambdaLR(optimizerG, lr_lambda=lr_lambda)
     schedulerD = torch.optim.lr_scheduler.LambdaLR(optimizerD, lr_lambda=lr_lambda)
 
-    # Loss functions
-    criterionGAN = nn.MSELoss()  # LSGAN
     criterionL1 = nn.L1Loss()
 
-    # Perceptual feature extractor
+    # Perceptual loss model (VGG)
     vgg_perc = VGGPerceptual(device).to(device)
 
     os.makedirs(cfg.save_dir, exist_ok=True)
@@ -1602,59 +1646,53 @@ def train_kaist(cfg: Config):
             ir = batch['ir'].to(device)
             rgb = batch['rgb'].to(device)
 
-            # -------------------------
-            # Update Discriminator (D)
-            # -------------------------
+            # --------------------
+            #  Update Discriminator D (Hinge loss)
+            # --------------------
             optimizerD.zero_grad()
-
-            # Generate fake RGB without gradients to avoid updating G during D step
             with torch.no_grad():
-                fake_rgb = model(ir)
-
-            # Discriminator input is concatenation: [IR, RGB]
+                fake_rgb_detached = model(ir)
             real_input = torch.cat([ir, rgb], dim=1)
-            fake_input = torch.cat([ir, fake_rgb], dim=1)
+            fake_input = torch.cat([ir, fake_rgb_detached], dim=1)
 
             pred_real = netD(real_input)
             pred_fake = netD(fake_input)
 
-            # LSGAN targets
-            target_real = torch.ones_like(pred_real)
-            target_fake = torch.zeros_like(pred_fake)
-
-            loss_D_real = criterionGAN(pred_real, target_real)
-            loss_D_fake = criterionGAN(pred_fake, target_fake)
+            # Hinge loss for D:
+            # L_D = E[max(0, 1 - D(real))] + E[max(0, 1 + D(fake))]
+            loss_D_real = F.relu(1.0 - pred_real).mean()
+            loss_D_fake = F.relu(1.0 + pred_fake).mean()
             loss_D = 0.5 * (loss_D_real + loss_D_fake)
-
             loss_D.backward()
             optimizerD.step()
 
-            # ----------------------
-            # Update Generator (G)
-            # ----------------------
+            # --------------------
+            #  Update Generator G
+            # --------------------
             optimizerG.zero_grad()
-
             fake_rgb = model(ir)
             fake_input = torch.cat([ir, fake_rgb], dim=1)
-            pred_fake = netD(fake_input)
+            pred_fake_for_G = netD(fake_input)
 
-            # GAN term: make D believe fake is real
-            target_real_for_G = torch.ones_like(pred_fake)
-            loss_G_GAN = criterionGAN(pred_fake, target_real_for_G)
+            # Hinge loss for G: L_G = -E[D(fake)]
+            loss_G_GAN = -pred_fake_for_G.mean()
 
-            # Pixel reconstruction term
             loss_G_L1 = criterionL1(fake_rgb, rgb) * cfg.lambda_L1
 
-            # Perceptual term on VGG features
+            # Perceptual loss
             feat_fake = vgg_perc(fake_rgb)
             feat_real = vgg_perc(rgb)
             loss_G_perc = F.l1_loss(feat_fake, feat_real) * cfg.lambda_perc
 
-            # TV regularizer on output
+            # TV loss
             loss_G_TV = tv_loss(fake_rgb) * cfg.lambda_tv
 
-            # Total generator loss
-            loss_G = loss_G_GAN + loss_G_L1 + loss_G_perc + loss_G_TV
+            # SSIM loss (images to [0,1] for structural similarity)
+            fake_01 = (fake_rgb + 1.0) / 2.0
+            real_01 = (rgb + 1.0) / 2.0
+            loss_G_ssim = ssim_loss_torch(fake_01, real_01) * cfg.lambda_ssim
+
+            loss_G = cfg.lambda_gan*loss_G_GAN + loss_G_L1 + loss_G_perc + loss_G_TV + loss_G_ssim
             loss_G.backward()
             optimizerG.step()
 
@@ -1662,16 +1700,15 @@ def train_kaist(cfg: Config):
             epoch_d_loss += loss_D.item()
             steps += 1
 
-            # Log training progress occasionally
             if i % 50 == 0 or i == 1:
                 print(
                     f"Epoch [{epoch}/{cfg.epochs}] Step [{i}/{len(train_loader)}] "
                     f"D: {loss_D.item():.4f} | G: {loss_G.item():.4f} "
                     f"(GAN {loss_G_GAN.item():.4f} + L1 {loss_G_L1.item():.4f} "
-                    f"+ Perc {loss_G_perc.item():.4f} + TV {loss_G_TV.item():.6f})"
+                    f"+ Perc {loss_G_perc.item():.4f} + TV {loss_G_TV.item():.6f} "
+                    f"+ SSIM {loss_G_ssim.item():.4f})"
                 )
 
-        # End-of-epoch summaries
         avg_g_loss = epoch_g_loss / max(steps, 1)
         avg_d_loss = epoch_d_loss / max(steps, 1)
         val_l1 = validate_kaist(model, val_loader, device)
@@ -1681,17 +1718,17 @@ def train_kaist(cfg: Config):
             f"val L1: {val_l1:.4f}"
         )
 
-        # Periodic checkpoint saves
+        # Save periodic checkpoints
         if (epoch % cfg.save_every == 0) or (epoch == cfg.epochs):
             ckpt_path = os.path.join(cfg.save_dir, f"netG_epoch_{epoch:03d}.pth")
             torch.save(model.netG.state_dict(), ckpt_path)
             print(f"Saved generator checkpoint to {ckpt_path}")
 
-        # Best checkpoint by validation L1
+        # Save best model based on validation L1
         if val_l1 < best_val_l1:
             best_val_l1 = val_l1
             torch.save(model.netG.state_dict(), best_ckpt_path)
-            print(f"Best model updated: {best_ckpt_path} (val L1={best_val_l1:.4f})")
+            print(f"New best model saved to {best_ckpt_path} (val L1={best_val_l1:.4f})")
 
         # Step LR schedulers
         schedulerG.step()
@@ -1703,7 +1740,7 @@ def train_kaist(cfg: Config):
 
 
 # =========================================================
-# 13) Entry point
+# 13) main
 # =========================================================
 
 def main():
