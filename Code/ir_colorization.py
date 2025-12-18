@@ -17,7 +17,7 @@ import functools
 # Perceptual loss backbone (VGG)
 from torchvision import models
 
-# SSIM metric (optional; used only during evaluation)
+# SSIM (skimage): evaluation metric only (training uses a differentiable SSIM implementation below)
 try:
     from skimage.metrics import structural_similarity as ssim
     HAVE_SKIMAGE = True
@@ -34,7 +34,9 @@ class Config:
     Central configuration container.
 
     This script supports two modes:
-      - "train": Train a Pix2Pix-style cGAN (PatchGAN + LSGAN) using KAIST paired IR (LWIR) and visible RGB.
+      - "train": Train a Pix2Pix-style conditional GAN using a PatchGAN discriminator and a hinge adversarial objective,
+                 combined with reconstruction/regularization losses (L1 + perceptual + TV + SSIM) on KAIST paired IR (LWIR)
+                 and visible RGB.
       - "test" : Run inference on KAIST test sets, save predictions, compute metrics (if GT exists),
                  optionally save side-by-side collages, and export Top-K best results.
 
@@ -68,6 +70,8 @@ class Config:
         self.no_antialias = False
         self.no_antialias_up = False
 
+        self.save_every = 5 # Save generator checkpoint every 5 epochs
+
         self.save_dir = r".\Weights\trained_w_night\checkpoints_kaist"
         self.output_dir = r".\results"
         self.test_G_weights = r".\Weights\trained_w_night\checkpoints_kaist\netG_best.pth"
@@ -92,7 +96,7 @@ class Config:
         self.beta1 = 0.5
         self.beta2 = 0.999
 
-        # Reconstruction / perceptual / regularization loss weights
+        # Loss weights (adversarial + reconstruction + perceptual + regularization)
         self.lambda_L1 = 30.0          # pixel L1 term
         self.lambda_perc = 30.0         # VGG perceptual term
         self.lambda_tv = 1e-4           # total variation term
@@ -101,10 +105,6 @@ class Config:
 
         # DataLoader settings
         self.num_workers = 4
-
-        # Checkpointing
-        self.save_dir = "./checkpoints_kaist"
-        self.save_every = 5
 
         # Validation split ratio (fraction of full training data)
         self.val_ratio = 0.1
@@ -222,10 +222,9 @@ def get_lr_lambda(cfg: Config):
         # Constant LR phase
         if e <= cfg.lr_decay_start_epoch:
             return 1.0
-	else:
         # Decay phase
-        	if e >= cfg.epochs:
-            	return 0.0
+        if e >= cfg.epochs:
+            return 0.0
 
         # Linearly decay from 1.0 to 0.0 between lr_decay_start_epoch and epochs
         frac = float(e - cfg.lr_decay_start_epoch) / float(max(1, cfg.epochs - cfg.lr_decay_start_epoch))
@@ -885,24 +884,12 @@ def save_rgb(path, img_rgb):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     Image.fromarray(img_rgb).save(path)
 
-
-def collect_images(input_dir):
-    """
-    Collect image file paths directly under input_dir (non-recursive).
-    """
-    exts = ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tif', '*.tiff']
-    files = []
-    for ext in exts:
-        files.extend(glob(os.path.join(input_dir, ext)))
-    return sorted(files)
-
-
 def collect_kaist_ir_files_from_sets(set_roots):
     """
     Recursively scan KAIST set directories and collect IR files under any 'lwir' folder.
 
     For each discovered IR file, record:
-      - ir_path: absolute path to the IR image
+      - ir_path: full path to the IR image
       - set_name: the set folder name (e.g., set02)
       - seq_rel : the relative sequence path from the set root (e.g., V000 or deeper)
 
@@ -1370,14 +1357,12 @@ def run_test(cfg: Config):
     model.eval()
     os.makedirs(cfg.output_dir, exist_ok=True)
 
-    # Prefer scanning test_roots recursively; fallback to single input_dir if test_roots is empty
+    # Recursively scan KAIST test set roots (cfg.test_roots) to collect LWIR frames
     if hasattr(cfg, "test_roots") and cfg.test_roots:
         entries = collect_kaist_ir_files_from_sets(cfg.test_roots)
         print(f"Found {len(entries)} IR images across test sets: {cfg.test_roots}")
     else:
-        img_paths = collect_images(cfg.input_dir)
-        entries = [(p, "input_dir", "seq") for p in img_paths]
-        print(f"Found {len(entries)} IR images in {cfg.input_dir}")
+        raise ValueError("cfg.test_roots is empty. Please set cfg.test_roots to KAIST set paths.")
 
     metrics_list = []
     sum_mae = 0.0
@@ -1537,7 +1522,7 @@ def validate_kaist(model: IRColorizationModel, val_loader, device):
     """
     Compute validation loss using only pixel-wise L1 distance.
 
-    This keeps validation fast and stable, while training may include GAN, perceptual, and TV terms.
+    This keeps validation fast and stable, while training may include GAN, perceptual, TV, and SSIM terms.
     """
     model.eval()
     l1 = nn.L1Loss()
