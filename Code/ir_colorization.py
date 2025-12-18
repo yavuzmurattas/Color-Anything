@@ -89,8 +89,8 @@ class Config:
         self.beta2 = 0.999
 
         # Loss weights (Pix2Pix-style)
-        self.lambda_L1 = 100.0          # pixel L1 term
-        self.lambda_perc = 10.0         # VGG perceptual term
+        self.lambda_L1 = 30.0          # pixel L1 term
+        self.lambda_perc = 30.0         # VGG perceptual term
         self.lambda_tv = 1e-4           # total variation term
 
         # DataLoader settings
@@ -105,7 +105,7 @@ class Config:
 
         # Learning rate decay schedule:
         # Keep LR constant until lr_decay_start_epoch, then linearly decay to zero at the final epoch.
-        self.lr_decay_start_epoch = 25
+        self.lr_decay_start_epoch = 40
 
         # Optional: initialize generator weights from a checkpoint before training begins
         self.init_G_weights = None  # e.g. r"./some_generator_checkpoint.pth"
