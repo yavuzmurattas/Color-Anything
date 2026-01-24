@@ -1,3 +1,9 @@
+## License / Usage
+Copyright (c) 2026 Yavuz Murat TAŞ. All rights reserved.
+
+No permission is granted to use, copy, modify, publish, distribute, sublicense,
+or sell this software or its derivatives without explicit written permission.
+
 # Color Anything
 
 This repository implements an end-to-end **thermal / infrared (LWIR) → visible (RGB)** image colorization pipeline using a **Pix2Pix-style conditional GAN** in **PyTorch**.  
